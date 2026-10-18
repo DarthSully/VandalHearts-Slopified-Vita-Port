@@ -351,14 +351,27 @@ void PC_SpuSetReverb(int on, float depth) {
 }
 
 static int RevOff(short r){ return (int)((unsigned short)r) * 4; }
-static int RevWrap(int i){ i %= REV_SAMPLES; if (i < 0) i += REV_SAMPLES; return i; }
+/* The reverb runs ~44100 times a second, and some hosts (ARM Cortex-A9: PS Vita) have no hardware
+ * divide, so the hot helpers avoid `%` and 64-bit `/`; every replacement is exact (same results). */
+static int RevWrap(int i){
+    if ((unsigned)i < (unsigned)REV_SAMPLES) return i;
+    if (i >= REV_SAMPLES && i < 2 * REV_SAMPLES) return i - REV_SAMPLES;
+    if (i < 0 && i >= -REV_SAMPLES) return i + REV_SAMPLES;
+    i %= REV_SAMPLES; if (i < 0) i += REV_SAMPLES; return i; }
+/* C division by 0x8000 truncates toward zero: bias negatives by 0x7FFF, then shift. */
+static long long RevDiv8000(long long p){ return (p + ((p >> 63) & 0x7FFF)) >> 15; }
 static int RevRd(int reg, int d){ return s_rev.buf[RevWrap(s_rev.cursor + RevOff(s_revStudioC[reg]) + d)]; }
 static int RevRdAt(int off){ return s_rev.buf[RevWrap(s_rev.cursor + off)]; }
 static void RevWr(int reg, int v){ s_rev.buf[RevWrap(s_rev.cursor + RevOff(s_revStudioC[reg]))] = (short)Clamp16(v); }
-static int RevMul(int s, short vol){ return (int)(((long long)s * (int)vol) / 0x8000); }
-static int RevFir(const short *h, int cur){ long long sum = 0; int i;
-    for (i = 0; i < REV_FIR_TAPS; i++) sum += (long long)s_revFir[i] * h[(cur + i) % REV_FIR_TAPS];
-    return Clamp16((int)(sum / 0x8000)); }
+static int RevMul(int s, short vol){ return (int)RevDiv8000((long long)s * (int)vol); }
+/* Odd taps are zero except the centre (i=19), so only the even taps and the centre contribute.
+ * Same terms, same order of the non-zero ones; integer sums are exact regardless of order. */
+static int RevFir(const short *h, int cur){ long long sum = 0; int i, j = cur;
+    for (i = 0; i < REV_FIR_TAPS; i++, j++) {
+        if (j >= REV_FIR_TAPS) j -= REV_FIR_TAPS;
+        if (s_revFir[i]) sum += (long long)s_revFir[i] * h[j];
+    }
+    return Clamp16((int)RevDiv8000(sum)); }
 static int RevReflect(int in, int fbReg, int wrReg){
     int prev = RevRd(wrReg, -1);
     int fb = RevMul(RevRd(fbReg, 0), s_revStudioC[R_VWALL]);
@@ -383,7 +396,7 @@ static void RevProcess(int sendL, int sendR, int *wetL, int *wetR) {
     int lin, rin, sameL, sameR, diffL, diffR, oL, oR;
     s_rev.inHistL[s_rev.inCur] = (short)Clamp16(sendL);
     s_rev.inHistR[s_rev.inCur] = (short)Clamp16(sendR);
-    s_rev.inCur = (s_rev.inCur + 1) % REV_FIR_TAPS;
+    if (++s_rev.inCur >= REV_FIR_TAPS) s_rev.inCur = 0;
     s_rev.phase ^= 1;
     if (s_rev.phase == 0) {                 /* process at 22050Hz (every other sample) */
         lin = RevMul(RevFir(s_rev.inHistL, s_rev.inCur), s_revStudioC[R_VLIN]);
@@ -399,11 +412,11 @@ static void RevProcess(int sendL, int sendR, int *wetL, int *wetR) {
         oL = RevApf(oL, R_MLAPF2, R_DAPF2, R_VAPF2); oR = RevApf(oR, R_MRAPF2, R_DAPF2, R_VAPF2);
         s_rev.outHistL[s_rev.outCur] = (short)Clamp16(oL);
         s_rev.outHistR[s_rev.outCur] = (short)Clamp16(oR);
-        s_rev.outCur = (s_rev.outCur + 1) % REV_FIR_TAPS;
+        if (++s_rev.outCur >= REV_FIR_TAPS) s_rev.outCur = 0;
         s_rev.cursor = RevWrap(s_rev.cursor + 1);
     } else {
         s_rev.outHistL[s_rev.outCur] = 0; s_rev.outHistR[s_rev.outCur] = 0;
-        s_rev.outCur = (s_rev.outCur + 1) % REV_FIR_TAPS;
+        if (++s_rev.outCur >= REV_FIR_TAPS) s_rev.outCur = 0;
     }
     oL = Clamp16(RevFir(s_rev.outHistL, s_rev.outCur) * 2);   /* upsample back to 44100 */
     oR = Clamp16(RevFir(s_rev.outHistR, s_rev.outCur) * 2);

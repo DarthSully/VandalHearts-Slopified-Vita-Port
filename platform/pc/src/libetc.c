@@ -299,8 +299,26 @@ int VSync(int mode) {
 
     PC_DiagVSyncRows();   /* the VH_*_LOG per-tick CSV rows (pc_diag.c) */
 
-    { extern void PC_CdXaUpdate(void); PC_CdXaUpdate(); } /* XA music streaming pump */
-    { extern void PC_SeqTick(void); PC_SeqTick(); }       /* SEQ (sequenced music) sequencer */
+    {   /* VH_FRAME_TIME=1: the audio pumps' share of the main thread, per VSync. */
+        static int on = -1; static double xaMs, seqMs; static int n;
+        Uint64 t0 = 0, t1 = 0, t2 = 0;
+        extern void PC_CdXaUpdate(void);
+        extern void PC_SeqTick(void);
+        if (on < 0) on = getenv("VH_FRAME_TIME") ? 1 : 0;
+        if (on) t0 = SDL_GetPerformanceCounter();
+        PC_CdXaUpdate();   /* XA music streaming pump */
+        if (on) t1 = SDL_GetPerformanceCounter();
+        PC_SeqTick();      /* SEQ (sequenced music) sequencer + software SPU render */
+        if (on) {
+            double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+            t2 = SDL_GetPerformanceCounter();
+            xaMs += (double)(t1 - t0) * f; seqMs += (double)(t2 - t1) * f;
+            if (++n >= 120) {
+                fprintf(stderr, "[audio] main thread per VSync: xa=%.2f ms, seq+spu=%.2f ms (%d)\n", xaMs / n, seqMs / n, n);
+                xaMs = seqMs = 0; n = 0;
+            }
+        }
+    }
 
     /* GPU-trace recording, battle-gated (VH_GPU_RECORD_BATTLE=1): arm the recorder from the same
      * battle-state set the fast-forward gate uses, so a trace captures pure battle content. */

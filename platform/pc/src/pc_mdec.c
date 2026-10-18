@@ -1,3 +1,4 @@
+#include <time.h>
 /* pc_mdec.c -- PS1 MDEC / STR (BS v2 & v3) video decoder, reimplemented from psx-spx (BS Compression
  * + macroblockdecodermdec). Pixel-parity with ffmpeg within 8/255 (float-vs-integer IDCT rounding).
  * Entry point: PC_MdecDecodeBS(bs, bsLen, w, h, outBGR555). See docs/pc-port/subsystems/mdec.md. */
@@ -215,9 +216,36 @@ static int decode_block(BitR *b, int dcCoef, int qScale, float *out) {
     return 0;
 }
 
+/* lrintf without the libm call: on ARM VFP, vcvtr rounds with the FPSCR mode (round-to-nearest-even
+ * by default), exactly as lrintf does; newlib's lrintf is an out-of-line call, three per pixel. */
+static inline int MdecRound(float x) {
+#if defined(__arm__) && defined(__ARM_FP)
+    float r; int i;
+    __asm__("vcvtr.s32.f32 %0, %1" : "=t"(r) : "t"(x));
+    __asm__("vmov %0, %1" : "=r"(i) : "t"(r));
+    return i;
+#else
+    return (int)lrintf(x);
+#endif
+}
+
 /* ---------------- full frame decode -> BGR555 (width*height) ------------------------- */
 static int s_idctReady = 0;
+static int MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, unsigned short *outBGR555);
+/* VH_FRAME_TIME=1: mean decode time per movie frame, every 60 frames. */
 int PC_MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, unsigned short *outBGR555) {
+    static int on = -1; static double acc; static int n;
+    struct timespec t0, t1; int r;
+    if (on < 0) on = getenv("VH_FRAME_TIME") ? 1 : 0;
+    if (!on) return MdecDecodeBS(bs, bsLen, width, height, outBGR555);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    r = MdecDecodeBS(bs, bsLen, width, height, outBGR555);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    acc += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (++n >= 60) { fprintf(stderr, "[mdec] %.2f ms per movie frame (%dx%d, %d frames)\n", acc / n, width, height, n); acc = 0; n = 0; }
+    return r;
+}
+static int MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, unsigned short *outBGR555) {
     if (!s_idctReady) { idct_init(); s_idctReady = 1; }
     if (bsLen < 8) return -1;
     u16 id      = (u16)(bs[2] | (bs[3]<<8));
@@ -269,7 +297,7 @@ int PC_MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, u
                 float R = yv + 1.402f*r;
                 float G = yv - 0.3437f*b - 0.7143f*r;
                 float B = yv + 1.772f*b;
-                int Ri = (int)lrintf(R)+128, Gi=(int)lrintf(G)+128, Bi=(int)lrintf(B)+128;
+                int Ri = MdecRound(R)+128, Gi = MdecRound(G)+128, Bi = MdecRound(B)+128;
                 if(Ri<0){Ri=0;} if(Ri>255){Ri=255;} if(Gi<0){Gi=0;} if(Gi>255){Gi=255;}
                 if(Bi<0){Bi=0;} if(Bi>255){Bi=255;}
                 u16 bgr = ((Bi>>3)<<10) | ((Gi>>3)<<5) | (Ri>>3);
