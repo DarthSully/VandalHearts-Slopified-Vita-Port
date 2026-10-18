@@ -222,6 +222,16 @@ unsigned int PadRead(int id) {
 
     /* OR in any connected gamepad. */
     p1 |= pc_pad_read();
+#ifdef __vita__
+    /* The Vita has no L2/R2: the rear touchpad stands in for the fast-forward triggers (pad-2
+     * L2/R2) -- right half = R2 (2x), left half = L2 (normal). platform/vita/src/vita_platform.c. */
+    {
+        extern int PC_VitaRearTouch(void);
+        int rt = PC_VitaRearTouch();
+        if (rt & 1) p1 |= (unsigned)PADL2 << 16;
+        if (rt & 2) p1 |= (unsigned)PADR2 << 16;
+    }
+#endif
 
     p1 |= PC_SmokePadHold();   /* VH_SMOKE boot harness: hold START through the intro movies (pc_diag.c) */
 

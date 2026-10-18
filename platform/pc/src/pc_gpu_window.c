@@ -2,7 +2,7 @@
  * VRAM and rasterizer; this file only knows the host window API. The rasterizer stays software-only:
  * SDL presents the finished RGB frame through Metal on macOS and OpenGL on the other desktops. */
 #include <SDL2/SDL.h>
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__vita__)
 #include <SDL2/SDL_opengl.h>
 #endif
 #include <stdlib.h>
@@ -14,7 +14,13 @@
 #include "pc_lang.h"       /* PC_LangSubtitleGlyph / PC_LangUtf8Decode (movie subtitle renderer) */
 
 static SDL_Window *s_window;
-#if defined(__APPLE__)
+/* macOS (Metal) and PS Vita (GXM) present through SDL_Renderer; everything else uses legacy GL. */
+#if defined(__APPLE__) || defined(__vita__)
+#define VH_SDL_PRESENT 1
+#else
+#define VH_SDL_PRESENT 0
+#endif
+#if VH_SDL_PRESENT
 static SDL_Renderer *s_renderer;
 static SDL_Texture *s_presentTexture;
 static int s_textureW, s_textureH;
@@ -611,10 +617,16 @@ int PC_GpuInit(int width, int height, const char *title) {
         isc = getenv("VH_INTERNAL_SCALE");
         PC_GpuSetInternalScale(isc ? atoi(isc) : 1);   /* resolve g_vhInternalScale (1 = off) */
     }
+#if defined(__vita__)
+    width = 960;
+    height = 544;
+#endif
     s_window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  width, height,
 #if defined(__APPLE__)
                                  SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#elif defined(__vita__)
+                                 0);   /* always the full 960x544 screen (size forced below) */
 #else
                                  SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
 #endif
@@ -640,6 +652,20 @@ int PC_GpuInit(int width, int height, const char *title) {
             s_renderer = SDL_CreateRenderer(s_window, metalDriver, SDL_RENDERER_ACCELERATED);
         if (!s_renderer) {
             fprintf(stderr, "PC_Gpu: Metal renderer unavailable: %s\n", SDL_GetError());
+            SDL_DestroyWindow(s_window); s_window = NULL; return 0;
+        }
+        SDL_GetRendererInfo(s_renderer, &info);
+        fprintf(stderr, "PC_Gpu: presentation renderer=%s\n", info.name ? info.name : "unknown");
+    }
+#elif defined(__vita__)
+    {
+        SDL_RendererInfo info;
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+        /* No PRESENTVSYNC: the game's own VSync() paces frames (same policy as the GL path's
+         * swap interval 0 below). */
+        s_renderer = SDL_CreateRenderer(s_window, -1, SDL_RENDERER_ACCELERATED);
+        if (!s_renderer) {
+            fprintf(stderr, "PC_Gpu: GXM renderer unavailable: %s\n", SDL_GetError());
             SDL_DestroyWindow(s_window); s_window = NULL; return 0;
         }
         SDL_GetRendererInfo(s_renderer, &info);
@@ -760,7 +786,7 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
     double pt0 = 0, pt1 = 0, pt2 = 0, pt3 = 0;
     (void)vramH;
 
-#if defined(__APPLE__)
+#if VH_SDL_PRESENT
     if (!s_window || !s_renderer) return; /* headless: no-op */
 #else
     if (!s_window || !s_glCtx) return; /* headless: no-op */
@@ -867,7 +893,7 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
     {
         int winW = w, winH = h, vpW, vpH, vpX, vpY;
         float srcAspect = (float)w / (float)h;
-#if defined(__APPLE__)
+#if VH_SDL_PRESENT
         SDL_Rect dst;
         SDL_GetRendererOutputSize(s_renderer, &winW, &winH);
 #else
@@ -881,7 +907,7 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
         vpX = (winW - vpW) / 2;
         vpY = (winH - vpH) / 2;
 
-#if defined(__APPLE__)
+#if VH_SDL_PRESENT
         if (!s_presentTexture || s_textureW != w || s_textureH != h) {
             if (s_presentTexture) SDL_DestroyTexture(s_presentTexture);
             s_presentTexture = SDL_CreateTexture(s_renderer, SDL_PIXELFORMAT_RGB24,
@@ -909,7 +935,7 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
 #endif
     }
     if (s_ptTime) pt2 = presentNowMs();
-#if defined(__APPLE__)
+#if VH_SDL_PRESENT
     SDL_RenderPresent(s_renderer);
 #else
     SDL_GL_SwapWindow(s_window);

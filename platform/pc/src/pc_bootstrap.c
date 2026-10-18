@@ -14,6 +14,11 @@
  * PE sections) remaps .rodata; there is no POSIX signal/backtrace/mmap path and no low-address
  * instruction emulation -- Windows relies on source-level PC_PORT guards. */
 #include <windows.h>          /* VirtualAlloc, VirtualProtect, GetModuleHandle, PE headers, GetModuleFileNameA */
+#elif defined(__vita__)
+/* PS Vita: no mmap at fixed addresses, no POSIX signals/backtrace, and .rodata is linked into the
+ * writable data segment (platform/vita/vita.ld). Like macOS it relies on the PC_PORT host-backed
+ * work buffers and, like Windows, on source-level PC_PORT guards. See platform/vita/README.md. */
+#include <unistd.h>
 #else
 #include <unistd.h>
 #include <sys/mman.h>
@@ -54,7 +59,7 @@
 #define PSX_NULL_MIRROR_BASE ((void *)0x00000000UL)
 #define PSX_NULL_MIRROR_SIZE PSX_RAM_SIZE
 
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__vita__)
 static int ReservePsxMemory(void *base, size_t size, const char *label) {
 #if defined(_WIN32)
     /* Win32 has no mmap: VirtualAlloc the fixed low address directly. Both PSX ranges sit in the
@@ -99,7 +104,7 @@ __attribute__((constructor))
 /* Non-static: the unified binary's pc_region_main.c calls the (prefix-renamed) pieces explicitly,
  * in the same order the constructors run here. */
 void PC_ReservePsxRam(void) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__vita__)
     /* arm64 Mach-O reserves the low 4GiB. PC_PORT call sites use host-backed work buffers. */
 #else
     ReservePsxMemory(PSX_RAM_BASE, PSX_RAM_SIZE, "PSX RAM range");
@@ -120,6 +125,10 @@ static int PC_GetExePath(char *out, size_t outSize) {
 #if defined(_WIN32)
     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)outSize);
     return (n > 0 && (size_t)n < outSize);
+#elif defined(__vita__)
+    /* No executable path on Vita: anchor everything (disc, ini, saves) in the app's data folder. */
+    int n = snprintf(out, outSize, "%s/vandalhearts.self", VH_VITA_DATA_DIR);
+    return n > 0 && (size_t)n < outSize;
 #elif defined(__APPLE__)
     uint32_t sz = (uint32_t)outSize;
     return _NSGetExecutablePath(out, &sz) == 0;   /* fails (sz set to needed) if buffer too small */
@@ -327,8 +336,8 @@ int PC_SaveIniConfig(const char *section, const char *key, const char *value) {
     }
     fclose(out);
 
-#if defined(_WIN32)
-    remove(iniPath);                 /* MinGW rename() won't clobber an existing target */
+#if defined(_WIN32) || defined(__vita__)
+    remove(iniPath);                 /* MinGW and Vita rename() won't clobber an existing target */
 #endif
     if (rename(tmpPath, iniPath) != 0) { remove(tmpPath); return 0; }
     return 1;
@@ -406,7 +415,7 @@ static const char *DefaultDiscPath(void) {
 /* Diagnostics (POSIX only; Windows relies on PC_PORT guards + a debugger): dump the call stack and
  * game state to stderr. SIGUSR1 samples a running/frozen process without ptrace and continues;
  * SIGSEGV/SIGBUS dumps before dying. Linked -rdynamic so backtrace() carries symbol names. */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__vita__)
 static void PC_DumpDiag(const char *tag) {
     void *frames[64];
     int n = backtrace(frames, 64);
@@ -483,7 +492,7 @@ static int VhDecodeMemAccess(const unsigned char *ip, int *outIsWrite, int *outG
 }
 #endif /* __i386__ && !_WIN32 */
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__vita__)
 #if defined(__i386__)   /* only the i386 NULL-decode fixup below calls this */
 /* Log a fixed-up NULL-region access once per unique instruction pointer (async-signal-safe-ish:
  * open/write/backtrace_symbols_fd, no malloc-heavy fprintf). */
@@ -794,7 +803,7 @@ void PC_BootstrapRegion(const char *discPathArg) {
       if (rp && *rp) { extern int PC_GpuReplayTrace(const char *path); exit(PC_GpuReplayTrace(rp)); } }
 
     PC_MakeRodataWritable();            /* make string-literal writes work without faulting (portable) */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__vita__)
     signal(SIGUSR1, PC_SigUsr1);        /* kill -USR1 <pid> -> stack dump (freeze diagnosis) */
     /* SIGSEGV/SIGBUS via sigaction+SA_SIGINFO so the handler gets the faulting address (si_addr) and
      * CPU context (for the NULL-read fixup). SA_NODEFER plus s_crashHandlerActive makes a handler

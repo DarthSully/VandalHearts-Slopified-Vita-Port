@@ -5,6 +5,32 @@
 cmake_minimum_required(VERSION 3.16)
 project(vandalhearts_pc C)
 
+# ---- PS Vita (VitaSDK toolchain) -------------------------------------------------------------
+# Configure with -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake (see
+# platform/vita/build.sh). Everything Vita-specific is gated on VH_VITA; see platform/vita/README.md.
+if(DEFINED VITASDK)
+    set(VH_VITA ON)
+    set(VITA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../vita)
+    include("${VITASDK}/share/vita.cmake" REQUIRED)
+    set(VH_VITA_BUILD "r01" CACHE STRING "Vita build tag (vandal-vita-<tag>.vpk)")
+    # No libwebp/libav on Vita (HD packs come later, if at all): native .hdi/MDEC paths only.
+    set(VH_WEBP OFF CACHE BOOL "" FORCE)
+    set(VH_HDVIDEO OFF CACHE BOOL "" FORCE)
+    if(NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(CMAKE_BUILD_TYPE RelWithDebInfo)
+    endif()
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
+    # ABI flags that must match the generator's sizeof probe (VH_EXTRA_CFLAGS below):
+    #  -fno-short-enums: the decomp's layouts assume 4-byte enums (PS1 GCC, x86); arm-vita-eabi
+    #                    defaults to small enums.
+    #  -fsigned-char:    PS1 MIPS GCC and x86 treat plain char as signed; ARM defaults to unsigned.
+    set(VH_VITA_ABI_FLAGS -fno-short-enums -fsigned-char)
+    add_compile_options(${VH_VITA_ABI_FLAGS} -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon
+                        -fno-strict-aliasing -fwrapv)
+    add_compile_definitions(VH_VITA_DATA_DIR="ux0:data/vandalhearts" VH_VITA_BUILD="${VH_VITA_BUILD}")
+    add_compile_options("SHELL:-include ${VITA_DIR}/include/vita_compat.h")
+endif()
+
 set(CMAKE_C_STANDARD 99)              # backend files are modern C; game files force -std=gnu89 per-source
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
@@ -79,17 +105,25 @@ file(CREATE_LINK ${PC_DIR}/include/inline_gte.h ${STAGE_DIR}/inline_gte.h SYMBOL
 
 # ---- external libs ----------------------------------------------------------------------------
 find_package(SDL2 REQUIRED)
-if(NOT APPLE)
+if(NOT APPLE AND NOT VH_VITA)
     find_package(OpenGL REQUIRED)
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)   # data-file + data-segment generators
 # libgpu.c's threaded hi-res rasterizer (P1) uses pthreads. Threads::Threads resolves to -lpthread on
 # Linux, winpthreads on MinGW (bundled as libwinpthread-1.dll), nothing on macOS -- so the link is
 # correct on every target instead of relying on glibc>=2.34 folding libpthread into libc.
+if(VH_VITA)
+    # Vita: pthread-embedded via -pthread at link; OpenAL is the small SDL2-backed shim in
+    # platform/vita/src/vita_al.c with its headers in platform/vita/include/AL.
+    set(OPENAL_LIB "")
+    set(OPENAL_INCLUDE_DIR ${VITA_DIR}/include)
+else()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 find_library(OPENAL_LIB NAMES openal OpenAL32 REQUIRED)   # 'openal' on Linux, 'OpenAL32' on MinGW/Windows
-if(NOT APPLE)
+endif()
+if(VH_VITA)
+elseif(NOT APPLE)
     find_path(OPENAL_INCLUDE_DIR AL/al.h REQUIRED)
 else()
     # The SDK framework exposes headers as <OpenAL/al.h>; no Homebrew include path is needed.
@@ -228,6 +262,10 @@ function(vh_source_path output stem)
 endfunction()
 
 set(ALL_OBJ_SRCS ${GAME_SRCS})
+if(VH_VITA)
+    set(VITA_SRCS ${VITA_DIR}/src/vita_al.c ${VITA_DIR}/src/vita_platform.c)
+    list(APPEND ALL_OBJ_SRCS ${VITA_SRCS})
+endif()
 foreach(_b ${BACKEND_PLAIN} libetc pc_diag pc_battle_speed libsnd libgte pc_gpu_window pc_balance ${DATA_PERM} ${DATA_PLAIN})
     vh_source_path(_source "${_b}")
     list(APPEND ALL_OBJ_SRCS ${_source})
@@ -336,6 +374,11 @@ foreach(_b ${BACKEND_PLAIN} libetc pc_diag pc_battle_speed libsnd libgte pc_gpu_
     vh_source_path(_port_source "${_b}")
     set_property(SOURCE ${_port_source} APPEND PROPERTY COMPILE_OPTIONS "${PORT_WARN}")
 endforeach()
+if(VH_VITA)
+    set_source_files_properties(${VITA_SRCS} PROPERTIES
+        COMPILE_OPTIONS "${PORT_WARN}"
+        INCLUDE_DIRECTORIES "${VITA_DIR}/include;${SDL2_INCLUDE_DIRS}")
+endif()
 foreach(_b libetc libsnd pc_balance pc_overlay)   # compile through the staged game headers -> game csqrt(int) decl
     set_property(SOURCE ${PC_DIR}/src/${_b}.c APPEND PROPERTY COMPILE_OPTIONS "-fno-builtin-csqrt")
 endforeach()
@@ -351,6 +394,10 @@ if(WIN32)
     set(_GEN_GL_LIB "-lopengl32")
     set(_GEN_AL_LIB "-lOpenAL32")
     set(_GEN_SDL_LIB "-lSDL2")
+elseif(VH_VITA)
+    set(_GEN_GL_LIB "")
+    set(_GEN_AL_LIB "")
+    set(_GEN_SDL_LIB "-lSDL2 -lSceGxm_stub -lSceDisplay_stub -lSceCtrl_stub -lSceAppMgr_stub -lSceAppUtil_stub -lSceAudio_stub -lSceAudioIn_stub -lSceSysmodule_stub -lSceIofilemgr_stub -lSceCommonDialog_stub -lSceTouch_stub -lSceHid_stub -lSceMotion_stub -lScePower_stub -lSceProcessmgr_stub -lSceKernelThreadMgr_stub -pthread")
 elseif(APPLE)
     set(_GEN_GL_LIB "")
     set(_GEN_AL_LIB "-framework OpenAL")
@@ -421,6 +468,13 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
 endif()
 if(VH_SANITIZE)
     list(APPEND GEN_ENV "VH_SAN=${VH_SANITIZE}")
+endif()
+if(VH_VITA)
+    # Nothing built for the Vita can run here, so the sizeof probe is compile-only (sizes read back
+    # with nm) and uses the same ABI flags as the real build.
+    string(REPLACE ";" " " _vita_abi "${VH_VITA_ABI_FLAGS}")
+    list(APPEND GEN_ENV "VH_SIZEOF_VIA_NM=1" "VH_TARGET_NM=${VITASDK}/bin/arm-vita-eabi-nm"
+         "VH_EXTRA_CFLAGS=${_vita_abi} -I${VITA_DIR}/include -include ${VITA_DIR}/include/vita_compat.h")
 endif()
 if(WIN32)
     # The generator's sizeof-probe compiles the staged PsyQ headers directly (not through CMake's
@@ -501,8 +555,16 @@ if(VH_REGION STREQUAL "jp")
 endif()
 endif()
 if(NOT VH_BLOB)   # everything below configures the executable target
+if(VH_VITA)
+    target_link_libraries(vandalhearts_pc PRIVATE SDL2::SDL2-static m
+        SceKernelThreadMgr_stub SceAppUtil_stub ScePower_stub SceIofilemgr_stub SceTouch_stub)
+    # --no-enum-size-warning: game code uses 4-byte enums (-fno-short-enums), newlib/SDL short ones;
+    # no enum-typed value crosses that boundary.
+    target_link_options(vandalhearts_pc PRIVATE -pthread -Wl,-q -Wl,--no-enum-size-warning -T ${VITA_DIR}/vita.ld)
+elseif(TRUE)
 target_link_libraries(vandalhearts_pc PRIVATE SDL2::SDL2 ${OPENAL_LIB} m Threads::Threads)
-if(NOT APPLE)
+endif()
+if(NOT APPLE AND NOT VH_VITA)
     target_link_libraries(vandalhearts_pc PRIVATE OpenGL::GL)
 endif()
 if(VH_WEBP)
@@ -637,5 +699,20 @@ if(APPLE)
         DEPENDS vandalhearts_pc ${PC_DIR}/tools/gen_macos_buildinfo.py
         COMMENT "Writing macOS reproducibility manifest"
         VERBATIM)
+endif()
+if(VH_VITA)
+    # PS Vita package: vandal-vita-<VH_VITA_BUILD>.vpk. Extended memory mode (ATTRIBUTE2=12) for the
+    # 192 MB heap in platform/vita/src/vita_platform.c.
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+    set(VITA_MAKE_FSELF_FLAGS "${VITA_MAKE_FSELF_FLAGS} -a 0x2800000000000001")
+    vita_create_self(eboot.bin vandalhearts_pc UNSAFE)
+    vita_create_vpk(vandal-vita-${VH_VITA_BUILD}.vpk VHPC00001 eboot.bin
+        VERSION 02.10
+        NAME "Vandal Hearts"
+        FILE ${VITA_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+        FILE ${VITA_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+        FILE ${VITA_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+        FILE ${VITA_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+        FILE ${PC_DIR}/vandalhearts.ini vandalhearts.ini)
 endif()
 endif()   # NOT VH_BLOB

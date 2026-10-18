@@ -189,6 +189,10 @@ OBJ_FILES_ENV = os.environ.get('VH_OBJ_FILES', '').split()
 LINK_LIBS_ENV = os.environ.get('VH_LINK_LIBS', '').split()
 EXTRA_CFLAGS = os.environ.get('VH_EXTRA_CFLAGS', '').split()
 HOST_CC = os.environ.get('VH_HOST_CC', '').split() or CC_CMD
+# Cross builds with no runnable host compiler of the target's width (e.g. the PS Vita): compile the
+# probe with the TARGET compiler only and read each sizeof back as a symbol size via nm. Nothing runs.
+SIZEOF_VIA_NM = os.environ.get('VH_SIZEOF_VIA_NM', '') == '1'
+NM_CMD = os.environ.get('VH_TARGET_NM', 'nm').split()
 
 # Sanitizer flags from the build. find_undefined_symbols() links the real build's objects, and
 # objects compiled with -fsanitize=... need the same flag or the link fails on __asan_* symbols
@@ -356,6 +360,11 @@ def run_sizeof_probe(results):
             out.write(LOCAL_TYPEDEFS)
             for s in syms:
                 out.write(results[s]['decl'] + '\n')
+            if SIZEOF_VIA_NM:
+                # Compile-only probe: each size becomes the size of a char array, read back with nm.
+                for s in syms:
+                    out.write(f'char vh_sz__{s}[sizeof({s})];\n')
+                return syms
             out.write('int main(void) {\n')
             for s in syms:
                 out.write(f'  printf("{s}|%zu\\n", sizeof({s}));\n')
@@ -366,8 +375,13 @@ def run_sizeof_probe(results):
     probe_bin = f'{WORK_DIR}/probe'
     for _ in range(15):
         syms = gen_probe(probe_c)
-        r = sh([*HOST_CC, *M32, *SAN, *EXTRA_CFLAGS, '-std=gnu89', '-DPERMUTER', f'-I{STAGE_DIR}', '-Iinclude', f'-I{PROJECT_ROOT}',
-                '-include', 'pc_forward_decls.h', probe_c, '-o', probe_bin])
+        if SIZEOF_VIA_NM:
+            r = sh([*CC_CMD, *M32, *EXTRA_CFLAGS, '-std=gnu89', '-DPERMUTER', f'-I{STAGE_DIR}', '-Iinclude',
+                    f'-I{PROJECT_ROOT}', '-include', 'pc_forward_decls.h', '-fno-common', '-c', probe_c,
+                    '-o', probe_bin + '.o'])
+        else:
+            r = sh([*HOST_CC, *M32, *SAN, *EXTRA_CFLAGS, '-std=gnu89', '-DPERMUTER', f'-I{STAGE_DIR}', '-Iinclude', f'-I{PROJECT_ROOT}',
+                    '-include', 'pc_forward_decls.h', probe_c, '-o', probe_bin])
         errors = [l for l in r.stderr.splitlines() if ': error:' in l]
         if not errors:
             break
@@ -381,7 +395,7 @@ def run_sizeof_probe(results):
             if ln < 0 or ln >= len(probe_lines):
                 continue    # error reported in an included header, not probe.c -- not a symbol line
             line = probe_lines[ln]
-            sm = re.search(r'printf\("([A-Za-z_]\w*)\|', line) or re.search(r'extern\s+[^;]*?\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*;', line)
+            sm = re.search(r'printf\("([A-Za-z_]\w*)\|', line) or re.search(r'char vh_sz__([A-Za-z_]\w*)\[', line) or re.search(r'extern\s+[^;]*?\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*;', line)
             if sm:
                 newly.add(sm.group(1))
         if not newly:
@@ -392,6 +406,14 @@ def run_sizeof_probe(results):
         print("probe: did not converge", file=sys.stderr)
 
     sizes = {}
+    if SIZEOF_VIA_NM:
+        # nm -S: "<value> <size> <type> <name>", sizes in hex.
+        out = sh([*NM_CMD, '-S', '--defined-only', probe_bin + '.o']).stdout if os.path.exists(probe_bin + '.o') else ''
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[3].startswith('vh_sz__'):
+                sizes[parts[3][len('vh_sz__'):]] = int(parts[1], 16)
+        return sizes, skip
     out = sh([probe_bin]).stdout if os.path.exists(probe_bin) else ''
     for line in out.splitlines():
         name, size = line.split('|')
@@ -455,6 +477,13 @@ def load_vram_addrs():
     return addrs
 
 
+def vram_from_splat_name(name):
+    """Last resort without the byte-exact PSX ELF: splat names unnamed data D_XXXXXXXX after its
+    VRAM address, so the address can be read from the name itself."""
+    m = re.match(r'^D_(8[0-9A-Fa-f]{7})$', name)
+    return int(m.group(1), 16) if m else None
+
+
 def generate(results, sizes, unresolved_by_probe):
     vram_addrs = load_vram_addrs()
     load_sections()
@@ -500,6 +529,8 @@ def generate(results, sizes, unresolved_by_probe):
         if s in UNCERTAIN_SIZE:
             out.append(f'/* {s}: size is gap-to-next-known-symbol, NOT authoritative -- TODO verify at runtime */')
         vram = vram_addrs.get(s)
+        if vram is None:
+            vram = vram_from_splat_name(s)
         off = vram_to_file_offset(vram) if vram is not None else None
         if off is None:
             if decl not in emitted_decls:

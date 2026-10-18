@@ -686,7 +686,7 @@ void PC_DiagFps(int mode) {
 /* Logs one line per gSpellsEx FX dispatch (build SPELLFX_LOG=1, enable VH_SPELLFX_LOG) to
  * vh_spellfx_log.txt and stderr; the handler NAME is resolved from the live function pointer via
  * dladdr (the port links -rdynamic). On Windows (no dladdr) the index alone is logged. */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__vita__)   /* no dladdr on Windows or the Vita */
 #include <dlfcn.h>
 #endif
 void PC_DiagSpellFxLog(int spellId, int slot, int objf) {
@@ -711,7 +711,7 @@ void PC_DiagSpellFxLog(int spellId, int slot, int objf) {
         else name[j++] = (char)c;
     }
     name[j] = '\0';
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__vita__)
     if (objf >= 0 && objf < 804 && gObjFunctionPointers[objf] != NULL) {
         Dl_info info;
         if (dladdr((void *)gObjFunctionPointers[objf], &info) && info.dli_sname != NULL)
