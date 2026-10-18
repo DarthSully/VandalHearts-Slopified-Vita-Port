@@ -5,7 +5,7 @@
 (menus 60 fps, battles at the game's own 30 fps, smooth FMVs), but it has **not been played all the way
 through**, so expect the odd bug.
 
-**[Download the latest VPK](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/releases/latest)**
+**[Download the latest VPK (r07)](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/raw/main/downloads/VandalHearts-Vita-r07.vpk)**
 
 ## Install
 
