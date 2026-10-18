@@ -189,6 +189,8 @@ static void idct8x8(float *blk) {   /* in-place, natural order */
 /* ---------------- one 8x8 block: DC halfword + AC run/level -> pixels ----------------- */
 /* Decode block coefficients from the huffman stream into a dequantized natural-order
  * float block, then IDCT. dcCoef already extracted (signed10), qScale from header. */
+/* Decode one block's dequantized coefficients into `out` (natural order); the IDCT is left to the
+ * caller (MdecAssembleMB), so it can run in parallel with other macroblocks. */
 static int decode_block(BitR *b, int dcCoef, int qScale, float *out) {
     float blk[64]; for (int i = 0; i < 64; i++) blk[i] = 0;
     blk[0] = (float)(dcCoef * QUANT[0]);        /* DC: *qt[0] (=2), no qscale */
@@ -211,7 +213,6 @@ static int decode_block(BitR *b, int dcCoef, int qScale, float *out) {
         if (lev < 0) v = -v;
         blk[p] = (float)v;
     }
-    idct8x8(blk);
     memcpy(out, blk, sizeof(blk));
     return 0;
 }
@@ -227,6 +228,37 @@ static inline int MdecRound(float x) {
 #else
     return (int)lrintf(x);
 #endif
+}
+
+typedef struct { float *coef; int width, height, mbH; unsigned short *out; } MdecFrame;
+static float *s_coef; static size_t s_coefCap;
+extern void PC_PoolParallelFor(int n, void (*fn)(int, void *), void *ctx);
+
+/* IDCT the six blocks of macroblock `i` and convert it to BGR555 (16x16 at its position). */
+static void MdecAssembleMB(int i, void *ctx) {
+    MdecFrame *fr = (MdecFrame *)ctx;
+    int mx = i / fr->mbH, my = i % fr->mbH, width = fr->width, height = fr->height;
+    float *c = &fr->coef[(size_t)i * 6 * 64];
+    float *Cr = c, *Cb = c + 64, *Yb = c + 128;
+    for (int blk = 0; blk < 6; blk++) idct8x8(c + blk * 64);
+    for (int sub = 0; sub < 4; sub++) {
+        int ox = (sub & 1) * 8, oy = (sub >> 1) * 8;
+        const float *Ys = Yb + sub * 64;
+        for (int yy = 0; yy < 8; yy++) for (int xx = 0; xx < 8; xx++) {
+            int px = mx*16 + ox + xx, py = my*16 + oy + yy;
+            if (px >= width || py >= height) continue;
+            float yv = Ys[yy*8+xx];
+            int cx = (ox+xx)/2, cy = (oy+yy)/2;
+            float r = Cr[cy*8+cx], b = Cb[cy*8+cx];
+            float R = yv + 1.402f*r;
+            float G = yv - 0.3437f*b - 0.7143f*r;
+            float B = yv + 1.772f*b;
+            int Ri = MdecRound(R)+128, Gi = MdecRound(G)+128, Bi = MdecRound(B)+128;
+            if(Ri<0){Ri=0;} if(Ri>255){Ri=255;} if(Gi<0){Gi=0;} if(Gi>255){Gi=255;}
+            if(Bi<0){Bi=0;} if(Bi>255){Bi=255;}
+            fr->out[py*width + px] = (u16)(((Bi>>3)<<10) | ((Gi>>3)<<5) | (Ri>>3));
+        }
+    }
 }
 
 /* ---------------- full frame decode -> BGR555 (width*height) ------------------------- */
@@ -256,18 +288,27 @@ static int MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int heigh
 
     int mbW = (width + 15) / 16, mbH = (height + 15) / 16;
     int oldY = 0, oldCr = 0, oldCb = 0;
-    float Cr[64], Cb[64], Y[4][64];
+    int parsed = 0, ret = 0;
+    MdecFrame fr;
+    size_t need = (size_t)mbW * mbH * 6 * 64;
+    if (s_coefCap < need) {
+        float *nc = (float *)realloc(s_coef, need * sizeof(float));
+        if (!nc) return -4;
+        s_coef = nc; s_coefCap = need;
+    }
 
-    /* macroblocks: column-major (down each 16-px column, then next column) */
+    /* Phase 1 (serial: the bitstream is a single VLC stream): every complete macroblock's coefficients.
+     * Macroblocks are column-major (down each 16-px column, then next column), index mx*mbH + my. */
     for (int mx = 0; mx < mbW; mx++) {
       for (int my = 0; my < mbH; my++) {
         int eof = 0, dc;
+        float *mbCoef = &s_coef[(size_t)parsed * 6 * 64];
         /* block order: Cr, Cb, Y1, Y2, Y3, Y4 */
         for (int blk = 0; blk < 6; blk++) {
             if (version == 3) {
                 int isY = (blk >= 2);
                 int off = dc_v3(&br, isY, &eof);
-                if (eof) return 0;                 /* clean end of frame */
+                if (eof) goto parsedAll;           /* clean end of frame */
 #ifdef V3_NOMASK
                 if (blk == 0)      { oldCr += off; dc = oldCr; }
                 else if (blk == 1) { oldCb += off; dc = oldCb; }
@@ -280,31 +321,16 @@ static int MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int heigh
 #endif
             } else { /* v2 */
                 dc = dc_v2(&br, &eof);
-                if (eof) return 0;
+                if (eof) goto parsedAll;
             }
-            float *dst = (blk==0)?Cr : (blk==1)?Cb : Y[blk-2];
-            if (decode_block(&br, dc, qScale, dst) < 0) return -3;
+            if (decode_block(&br, dc, qScale, mbCoef + blk * 64) < 0) { ret = -3; goto parsedAll; }
         }
-        /* assemble 16x16 macroblock -> BGR555 at (mx*16, my*16) */
-        for (int sub = 0; sub < 4; sub++) {
-            int ox = (sub & 1) * 8, oy = (sub >> 1) * 8;
-            for (int yy = 0; yy < 8; yy++) for (int xx = 0; xx < 8; xx++) {
-                int px = mx*16 + ox + xx, py = my*16 + oy + yy;
-                if (px >= width || py >= height) continue;
-                float yv = Y[sub][yy*8+xx];
-                int cx = (ox+xx)/2, cy = (oy+yy)/2;
-                float r = Cr[cy*8+cx], b = Cb[cy*8+cx];
-                float R = yv + 1.402f*r;
-                float G = yv - 0.3437f*b - 0.7143f*r;
-                float B = yv + 1.772f*b;
-                int Ri = MdecRound(R)+128, Gi = MdecRound(G)+128, Bi = MdecRound(B)+128;
-                if(Ri<0){Ri=0;} if(Ri>255){Ri=255;} if(Gi<0){Gi=0;} if(Gi>255){Gi=255;}
-                if(Bi<0){Bi=0;} if(Bi>255){Bi=255;}
-                u16 bgr = ((Bi>>3)<<10) | ((Gi>>3)<<5) | (Ri>>3);
-                outBGR555[py*width + px] = bgr;
-            }
-        }
+        parsed++;
       }
     }
-    return 0;
+parsedAll:
+    /* Phase 2 (parallel): IDCT + colour conversion per macroblock; macroblocks write disjoint pixels. */
+    fr.coef = s_coef; fr.width = width; fr.height = height; fr.mbH = mbH; fr.out = outBGR555;
+    PC_PoolParallelFor(parsed, MdecAssembleMB, &fr);
+    return ret;
 }

@@ -287,10 +287,14 @@ int VSync(int mode) {
         Uint32 now = SDL_GetTicks();
         s_nextVBlankMs += totalMs;
         if ((double)now < s_nextVBlankMs) {
-            /* Idle anyway: finish + present an in-flight async frame first (no-op otherwise). */
-            { extern void PC_GpuAsyncFinish(void); PC_GpuAsyncFinish(); now = SDL_GetTicks(); }
+            /* Present an async frame that has already finished; never block on one still drawing --
+             * the next tick then overlaps it, and the next DrawOTag (or VRAM access) completes it. */
+            extern void PC_GpuAsyncService(void);
+            PC_GpuAsyncService();
+            now = SDL_GetTicks();
             if ((double)now < s_nextVBlankMs)
                 PC_DiagIdleDelay((unsigned)(s_nextVBlankMs - now));   /* SDL_Delay, timed under VH_FRAME_TIME */
+            PC_GpuAsyncService();
         } else if ((double)now - s_nextVBlankMs > totalMs) {
             s_nextVBlankMs = (double)now;     /* > one frame behind: genuine stall, resync */
         }

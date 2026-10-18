@@ -34,7 +34,11 @@ Empty files in `ux0:data/vandalhearts/`:
 
 | File | Effect |
 |---|---|
-| `profile` | Present and raster timing lines in the log (`VH_PRESENT_TIME`, `VH_RASTER_TIME`) |
+| `profile` | Timing lines in the log: FPS, work/idle split, raster, present, audio, MDEC |
+| `no_core3` | Keep the port off core 3 even when a core-unlock plugin makes it available |
+
+Performance-related `vandalhearts.ini` keys: `VH_RASTER_THREADS` (default 4 with core 3 unlocked,
+else 3), `VH_NATIVE_THREADS=0` (draw on one thread), `VH_RASTER_ASYNC=0` (no drawing/game overlap).
 
 Every `VH_*` option from [OPTIONS.md](../pc/OPTIONS.md) also works through `vandalhearts.ini`.
 
@@ -72,4 +76,20 @@ Requirements: VitaSDK with SDL2 for Vita (2.32 tested), cmake, python3. Builds a
   symbols fall back to the address in their name.
 - **No HD packs yet** (`VH_WEBP`/`VH_HDVIDEO` off): native backgrounds and MDEC movies.
 - `src/vita_platform.c`: clocks (444 MHz), data folder + log, heap (192 MB, extended memory mode),
-  stacks, rear-touch L2/R2.
+  stacks, core-3 probe and raster worker pinning, touch controls.
+
+## Performance work (see HANDOFF.md for the measurements)
+
+- **Banded multithreaded raster** (`pc_raster.c`): each DrawOTag's primitives are recorded and drawn
+  in row chunks across up to 4 cores; per band, prims outside the rows are skipped before setup.
+  Frames that sample textures from their own draw area are drawn serially. Pixel-identical
+  (`tools/raster_selftest.c`).
+- **Span fast path**: texture/CLUT/window/dither decisions hoisted per span; unmodulated texels
+  copied directly. Pixel-identical.
+- **Async raster**: DrawOTag returns while the workers draw; the frame is presented when done
+  (VSync, VRAM access, DrawSync or the next DrawOTag), so game logic overlaps drawing.
+- **Direct present**: BGR555 -> ABGR8888 through a LUT straight into a streaming texture.
+- **Division-free SPU reverb** (`pc_spu.c`): the A9 has no divide instruction; `%` and 64-bit
+  `/0x8000` replaced with exact equivalents (bit-identical over 2M samples).
+- **MDEC**: sparse IDCT, inline `vcvtr` rounding, and a serial-parse / parallel-assemble split across
+  the pool (`tools/mdec_selftest.c`: identical output).

@@ -794,6 +794,7 @@ static struct {
     int chunkY[RASTER_MAX_CHUNKS], chunkH[RASTER_MAX_CHUNKS], nchunks;
     int next;       /* next unclaimed chunk (under mtx) */
     int busy;       /* an asynchronous dispatch is in flight */
+    void (*fn)(int, void *); void *fnCtx;   /* parallel-for job (PC_PoolParallelFor), else raster */
     struct timespec t0, t1;   /* dispatch start / last worker done (async timing) */
     pthread_mutex_t mtx;
     pthread_cond_t start_cv, done_cv;
@@ -810,6 +811,10 @@ static int PoolClaimChunk(void) {
 }
 static void PoolRunChunks(void) {
     int i;
+    if (s_hpool.fn) {
+        while ((i = PoolClaimChunk()) >= 0) s_hpool.fn(i, s_hpool.fnCtx);
+        return;
+    }
     while ((i = PoolClaimChunk()) >= 0)
         PrimListRasterizeBand(s_hpool.list, s_hpool.chunkY[i], s_hpool.chunkH[i]);
 }
@@ -880,6 +885,29 @@ static void PrimListDispatch(const PrimList *l, int clipY, int clipH, int nth, i
 }
 static void PrimListRasterizeThreaded(const PrimList *l, int clipY, int clipH, int nth) {
     PrimListDispatch(l, clipY, clipH, nth, 0);
+}
+
+/* Run fn(0..n-1, ctx) across the raster pool and this thread; returns when all are done. Items are
+ * claimed one at a time, so they should be independent and roughly similar in cost. Completes any
+ * in-flight async raster pass first (the pool runs one job at a time). */
+void PC_PoolParallelFor(int n, void (*fn)(int, void *), void *ctx) {
+    int i, nth = HiresThreadCount();
+    if (n <= 0) return;
+    if (nth <= 1 || n < 2) { for (i = 0; i < n; i++) fn(i, ctx); return; }
+    PC_GpuAsyncFinish();
+    if (!s_hpool.inited) HiresPoolInit(nth - 1);
+    pthread_mutex_lock(&s_hpool.mtx);
+    s_hpool.fn = fn; s_hpool.fnCtx = ctx;
+    s_hpool.nchunks = n; s_hpool.next = 0;
+    s_hpool.done = 0; s_hpool.gen++;
+    s_hpool.busy = 1;
+    pthread_cond_broadcast(&s_hpool.start_cv);
+    pthread_mutex_unlock(&s_hpool.mtx);
+    PoolRunChunks();
+    pthread_mutex_lock(&s_hpool.mtx);
+    while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
+    s_hpool.busy = 0; s_hpool.fn = NULL;
+    pthread_mutex_unlock(&s_hpool.mtx);
 }
 
 /* Asynchronous native pass: in flight? done? wait. The wait returns the dispatch-to-finish wall
