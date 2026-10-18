@@ -55,6 +55,13 @@ void HiresAppendQuad(const RenderCtx *rch, RVert a, RVert b, RVert c, RVert d,
                      int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr);
 void HiresAppendRect(const RenderCtx *rch, int x, int y, int w, int h, int r, int g, int b);
 void HiresRasterizeThreaded(int clipY, int clipH);
+/* Deferred native (1x) pass, banded across the raster pool (default on PS Vita; VH_NATIVE_THREADS). */
+int  NativeDeferActive(void);
+void NativeFrameReset(void);
+void NativeAppendQuad(const RenderCtx *rcn, RVert a, RVert b, RVert c, RVert d,
+                      int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr);
+void NativeAppendRect(const RenderCtx *rcn, int x, int y, int w, int h, int r, int g, int b);
+void NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH);
 int  HiresActive(void);                                        /* scale > 1 and the buffer exists */
 void HiresPresent(int dispX, int dispY, int dispW, int dispH); /* edge-clamp + dump hook + present */
 extern volatile sig_atomic_t g_vhHiresDumpReq;   /* SIGUSR2 latch: dump the hires pair this frame */

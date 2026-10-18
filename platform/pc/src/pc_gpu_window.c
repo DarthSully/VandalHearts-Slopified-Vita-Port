@@ -779,6 +779,53 @@ static double presentNowMs(void) {
     return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency();
 }
 
+#if defined(__vita__)
+/* BGR555 -> ABGR8888 (bytes R,G,B,A) with the same 5->8-bit bit replication as the general path. */
+static Uint32 s_lut555[32768];
+static SDL_Texture *s_fastTex;
+static int s_fastW, s_fastH;
+
+static void VitaPresentDirect(const unsigned short *vram, int vramW, int x, int y, int w, int h) {
+    static int lutReady = 0;
+    void *pixels;
+    int pitch, px, py, winW, winH, vpW, vpH;
+    SDL_Rect dst;
+    if (!lutReady) {
+        int c;
+        for (c = 0; c < 32768; c++) {
+            int r5 = c & 0x1F, g5 = (c >> 5) & 0x1F, b5 = (c >> 10) & 0x1F;
+            Uint32 r8 = (Uint32)((r5 << 3) | (r5 >> 2)), g8 = (Uint32)((g5 << 3) | (g5 >> 2));
+            Uint32 b8 = (Uint32)((b5 << 3) | (b5 >> 2));
+            s_lut555[c] = 0xFF000000u | (b8 << 16) | (g8 << 8) | r8;
+        }
+        lutReady = 1;
+    }
+    if (!s_fastTex || s_fastW != w || s_fastH != h) {
+        if (s_fastTex) SDL_DestroyTexture(s_fastTex);
+        s_fastTex = SDL_CreateTexture(s_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+        s_fastW = w; s_fastH = h;
+        if (!s_fastTex) { fprintf(stderr, "PC_Gpu: could not create the present texture: %s\n", SDL_GetError()); return; }
+        SDL_SetTextureScaleMode(s_fastTex, SDL_ScaleModeNearest);
+    }
+    if (SDL_LockTexture(s_fastTex, NULL, &pixels, &pitch) != 0) return;
+    for (py = 0; py < h; py++) {
+        const unsigned short *src = &vram[(y + py) * vramW + x];
+        Uint32 *out = (Uint32 *)((Uint8 *)pixels + (size_t)py * (size_t)pitch);
+        for (px = 0; px < w; px++) out[px] = s_lut555[src[px] & 0x7FFF];
+    }
+    SDL_UnlockTexture(s_fastTex);
+
+    SDL_GetRendererOutputSize(s_renderer, &winW, &winH);
+    vpW = winW; vpH = (int)((float)winW * h / w + 0.5f);
+    if (vpH > winH) { vpH = winH; vpW = (int)((float)winH * w / h + 0.5f); }
+    dst.x = (winW - vpW) / 2; dst.y = (winH - vpH) / 2; dst.w = vpW; dst.h = vpH;
+    SDL_SetRenderDrawColor(s_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(s_renderer);
+    SDL_RenderCopy(s_renderer, s_fastTex, NULL, &dst);
+    SDL_RenderPresent(s_renderer);
+}
+#endif
+
 void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
                     int x, int y, int w, int h) {
     int px, py;
@@ -809,6 +856,29 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
     PC_GpuPumpEvents();
 
     if (w <= 0 || h <= 0) return;
+
+#if defined(__vita__)
+    /* Fast path: nothing to draw on top (no options overlay, OSD, fast-forward tag or movie
+     * subtitles) -> convert straight into a 32-bit streaming texture, top-down. The general path's
+     * 24-bit scratch costs a second, much slower conversion inside SDL (GXM has no 24-bit textures). */
+    {
+        extern int PC_BattleSpeedGet(void);
+        int osd = getenv("VH_CAM_OSD") != NULL && g_camOsdText[0];
+        int subs = (s_movieOverlay != NULL) && msubs > 1;
+        if (!s_movieOverlayRGB && !subs && !osd && !PC_OverlayIsOpen() && PC_BattleSpeedGet() <= 1) {
+            VitaPresentDirect(vram, vramW, x, y, w, h);
+            if (s_ptTime) {
+                double t = presentNowMs();
+                s_ptConv += t - pt0;
+                if (++s_ptN >= 120) {
+                    fprintf(stderr, "[present] direct: %.2f ms/frame (%u frames)\n", s_ptConv / s_ptN, s_ptN);
+                    s_ptConv = s_ptOsd = s_ptPresent = 0; s_ptN = 0;
+                }
+            }
+            return;
+        }
+    }
+#endif
 
     if (s_scratchCap < w * h * 3) {
         free(s_rgbaScratch);

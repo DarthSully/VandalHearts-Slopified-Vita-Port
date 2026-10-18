@@ -615,51 +615,77 @@ void FillRectRaw(int x0, int y0, int w, int h, int r, int g, int b) {
     HiresMirrorRect(x0, y0, w, h);   /* keep the hi-res FB in sync (ClearImage / quick fill) */
 }
 
-/* ---- Deferred hi-res pass via a per-frame display list: DrawOTag APPENDS each hi-res primitive here
- * (with a self-contained RenderCtx snapshot) and the whole list is rasterized after the native walk.
- * Flat and read-only, so N per-band worker threads consume it lock-free. Reused across frames. */
+/* ---- Deferred display lists. DrawOTag APPENDS each primitive (with a self-contained RenderCtx
+ * snapshot) and the list is rasterized after the walk. Flat and read-only, so worker threads consume
+ * it lock-free, each owning a disjoint band of scanlines. Two lists: the hi-res pass (always deferred
+ * when supersampling) and, where enabled (NativeDeferActive), the native 1x pass. Reused per frame. */
 typedef struct {
     int kind;                 /* 0 = quad (F4/FT4/SPRT), 1 = rect (TILE) */
     RVert v[4];               /* quad vertices */
     int rx, ry, rw, rh;       /* rect (TILE) */
     int r, g, b, textured, tpage, clut, semiTrans, abr;
-    RenderCtx rc;             /* per-prim snapshot: target=1, scale, clip (full), dither, texture window */
+    int ymin, ymax;           /* conservative screen-space row span (native units), for band culling */
+    RenderCtx rc;             /* per-prim snapshot: target, scale, clip, dither, texture window */
 } HiresPrim;
-static HiresPrim *s_hprims = NULL;
-static int s_hprimCount = 0, s_hprimCap = 0;
+typedef struct { HiresPrim *p; int n, cap; } PrimList;
+static PrimList s_hlist, s_nlist;
 
-static HiresPrim *HiresPrimNext(void) {
-    if (s_hprimCount >= s_hprimCap) {
-        int nc = s_hprimCap ? s_hprimCap * 2 : 8192;
-        HiresPrim *np = (HiresPrim *)realloc(s_hprims, (size_t)nc * sizeof(HiresPrim));
+static HiresPrim *PrimListNext(PrimList *l) {
+    if (l->n >= l->cap) {
+        int nc = l->cap ? l->cap * 2 : 8192;
+        HiresPrim *np = (HiresPrim *)realloc(l->p, (size_t)nc * sizeof(HiresPrim));
         if (!np) return NULL;
-        s_hprims = np; s_hprimCap = nc;
+        l->p = np; l->cap = nc;
     }
-    return &s_hprims[s_hprimCount++];
+    return &l->p[l->n++];
+}
+static void PrimListQuad(PrimList *l, const RenderCtx *rc, RVert a, RVert b, RVert c, RVert d,
+                         int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr) {
+    HiresPrim *hp = PrimListNext(l); double y0, y1;
+    if (!hp) return;
+    hp->kind = 0; hp->v[0] = a; hp->v[1] = b; hp->v[2] = c; hp->v[3] = d;
+    hp->r = r; hp->g = g; hp->b = bcol; hp->textured = textured;
+    hp->tpage = tpage; hp->clut = clut; hp->semiTrans = semi; hp->abr = abr; hp->rc = *rc;
+    y0 = y1 = a.y;
+    if (b.y < y0) y0 = b.y; if (b.y > y1) y1 = b.y;
+    if (c.y < y0) y0 = c.y; if (c.y > y1) y1 = c.y;
+    if (d.y < y0) y0 = d.y; if (d.y > y1) y1 = d.y;
+    hp->ymin = (int)y0 - 1 + rc->ofsY; hp->ymax = (int)y1 + 1 + rc->ofsY;   /* +-1: lround slack */
+}
+static void PrimListRect(PrimList *l, const RenderCtx *rc, int x, int y, int w, int h, int r, int g, int b) {
+    HiresPrim *hp = PrimListNext(l); if (!hp) return;
+    hp->kind = 1; hp->rx = x; hp->ry = y; hp->rw = w; hp->rh = h;
+    hp->r = r; hp->g = g; hp->b = b; hp->textured = 0; hp->rc = *rc;
+    hp->ymin = y + rc->ofsY; hp->ymax = y + h + rc->ofsY;
 }
 void HiresAppendQuad(const RenderCtx *rch, RVert a, RVert b, RVert c, RVert d,
                             int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr) {
-    HiresPrim *hp = HiresPrimNext(); if (!hp) return;
-    hp->kind = 0; hp->v[0] = a; hp->v[1] = b; hp->v[2] = c; hp->v[3] = d;
-    hp->r = r; hp->g = g; hp->b = bcol; hp->textured = textured;
-    hp->tpage = tpage; hp->clut = clut; hp->semiTrans = semi; hp->abr = abr; hp->rc = *rch;
+    PrimListQuad(&s_hlist, rch, a, b, c, d, r, g, bcol, textured, tpage, clut, semi, abr);
 }
 void HiresAppendRect(const RenderCtx *rch, int x, int y, int w, int h, int r, int g, int b) {
-    HiresPrim *hp = HiresPrimNext(); if (!hp) return;
-    hp->kind = 1; hp->rx = x; hp->ry = y; hp->rw = w; hp->rh = h;
-    hp->r = r; hp->g = g; hp->b = b; hp->rc = *rch;
+    PrimListRect(&s_hlist, rch, x, y, w, h, r, g, b);
+}
+void NativeAppendQuad(const RenderCtx *rcn, RVert a, RVert b, RVert c, RVert d,
+                      int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr) {
+    PrimListQuad(&s_nlist, rcn, a, b, c, d, r, g, bcol, textured, tpage, clut, semi, abr);
+}
+void NativeAppendRect(const RenderCtx *rcn, int x, int y, int w, int h, int r, int g, int b) {
+    PrimListRect(&s_nlist, rcn, x, y, w, h, r, g, b);
 }
 
-/* Rasterize the appended hi-res prims into the scanline band [clipY, clipY+clipH) (native units; the
- * fill functions scale by rc.scale). OT order preserved; overriding only clipY/clipH keeps threads on
- * disjoint rows. */
-static void HiresRasterizeBand(int clipY, int clipH) {
-    int i;
-    for (i = 0; i < s_hprimCount; i++) {
-        HiresPrim *hp = &s_hprims[i];
+/* Rasterize a list into the scanline band [clipY, clipY+clipH) (native units; the fill functions
+ * scale by rc.scale). OT order preserved; narrowing only the clip rows keeps threads on disjoint rows,
+ * and prims entirely outside the band are skipped before any setup. */
+static void PrimListRasterizeBand(const PrimList *l, int clipY, int clipH) {
+    int i, bandEnd = clipY + clipH;
+    for (i = 0; i < l->n; i++) {
+        const HiresPrim *hp = &l->p[i];
         RenderCtx rc = hp->rc;
         int semi = hp->semiTrans;
-        rc.clipY = clipY; rc.clipH = clipH;
+        int cy0 = rc.clipY > clipY ? rc.clipY : clipY;
+        int cy1 = (rc.clipY + rc.clipH) < bandEnd ? (rc.clipY + rc.clipH) : bandEnd;
+        if (hp->ymax < clipY || hp->ymin >= bandEnd || cy1 <= cy0) continue;
+        rc.clipY = cy0; rc.clipH = cy1 - cy0;
         if (hp->kind == 0)
             FillQuad(&rc, hp->v[0], hp->v[1], hp->v[2], hp->v[3], hp->r, hp->g, hp->b,
                      hp->textured, hp->tpage, hp->clut, semi, hp->abr);
@@ -667,12 +693,12 @@ static void HiresRasterizeBand(int clipY, int clipH) {
             FillRect(&rc, hp->rx, hp->ry, hp->rw, hp->rh, hp->r, hp->g, hp->b);
     }
 }
+static void HiresRasterizeBand(int clipY, int clipH) { PrimListRasterizeBand(&s_hlist, clipY, clipH); }
 
-/* Rasterize the hi-res list across N worker threads, each owning a scanline band of the drawing area:
- * bands write DISJOINT rows and the list is read-only, so no locking. VH_RASTER_THREADS overrides the
- * count (default = online CPUs, capped). A tiny list or one thread falls back to single-threaded. */
+/* Thread count: VH_RASTER_THREADS overrides (default = online CPUs, capped). The calling thread
+ * rasterizes too, so N threads = N-1 pool workers. */
 #define HIRES_MAX_THREADS 32
-typedef struct { int clipY, clipH; } HiresBand;
+#define RASTER_MAX_CHUNKS 64
 
 static int HiresThreadCount(void) {
     static int n = -1;
@@ -682,36 +708,60 @@ static int HiresThreadCount(void) {
         else { int c = PC_CpuCount(); n = (c > 1) ? c : 1; }   /* OS-agnostic (SDL under the hood), see pc_platform.h */
         if (n > HIRES_MAX_THREADS) n = HIRES_MAX_THREADS;
         if (n < 1) n = 1;
-        fprintf(stderr, "[raster] hi-res worker threads: %d%s\n", n, e ? " (VH_RASTER_THREADS)" : " (auto)");
+        fprintf(stderr, "[raster] worker threads: %d%s\n", n, e ? " (VH_RASTER_THREADS)" : " (auto)");
     }
     return n;
 }
 
-/* PERSISTENT worker pool: threads are created ONCE and reused every hi-res frame, driven by a generation
- * counter (per-frame pthread_create/join costs a few % of a 60 fps budget). Band writes are disjoint, so
- * the mutex/condvars only gate the start/finish handshake. Idle workers (band clipH==0) finish instantly. */
+/* PERSISTENT worker pool: threads are created ONCE and reused every dispatch, driven by a generation
+ * counter (per-frame pthread_create/join costs a few % of a 60 fps budget). A dispatch splits the
+ * clip rows into small chunks that the workers and the caller claim from a shared counter, so a band
+ * dense with primitives doesn't leave the other threads idle. */
 static struct {
     int inited, nworkers;
     pthread_t th[HIRES_MAX_THREADS];
-    HiresBand band[HIRES_MAX_THREADS];
+    const PrimList *list;
+    int chunkY[RASTER_MAX_CHUNKS], chunkH[RASTER_MAX_CHUNKS], nchunks;
+    int next;       /* next unclaimed chunk (under mtx) */
     pthread_mutex_t mtx;
     pthread_cond_t start_cv, done_cv;
     unsigned gen;   /* bumped per dispatch */
     int done;       /* workers finished this gen */
 } s_hpool;
 
+static int PoolClaimChunk(void) {
+    int i;
+    pthread_mutex_lock(&s_hpool.mtx);
+    i = (s_hpool.next < s_hpool.nchunks) ? s_hpool.next++ : -1;
+    pthread_mutex_unlock(&s_hpool.mtx);
+    return i;
+}
+static void PoolRunChunks(void) {
+    int i;
+    while ((i = PoolClaimChunk()) >= 0)
+        PrimListRasterizeBand(s_hpool.list, s_hpool.chunkY[i], s_hpool.chunkH[i]);
+}
+
+#ifdef __vita__
+extern void PC_VitaRasterWorkerStart(int id);   /* platform/vita: core affinity + priority */
+#endif
+
 static void *HiresPoolWorker(void *arg) {
     int id = (int)(uintptr_t)arg; unsigned seen = 0;   /* LLP64-safe: Win64 long is 32-bit */
+#ifdef __vita__
+    PC_VitaRasterWorkerStart(id);
+#endif
     for (;;) {
         pthread_mutex_lock(&s_hpool.mtx);
         while (s_hpool.gen == seen) pthread_cond_wait(&s_hpool.start_cv, &s_hpool.mtx);
         seen = s_hpool.gen;
         pthread_mutex_unlock(&s_hpool.mtx);
-        HiresRasterizeBand(s_hpool.band[id].clipY, s_hpool.band[id].clipH);
+        PoolRunChunks();
         pthread_mutex_lock(&s_hpool.mtx);
         if (++s_hpool.done == s_hpool.nworkers) pthread_cond_signal(&s_hpool.done_cv);
         pthread_mutex_unlock(&s_hpool.mtx);
     }
+    (void)id;
     return NULL;
 }
 
@@ -726,32 +776,96 @@ static void HiresPoolInit(int nworkers) {
     s_hpool.inited = 1;
 }
 
+/* Rasterize `l` over rows [clipY, clipY+clipH) on the pool plus this thread. */
+static void PrimListRasterizeThreaded(const PrimList *l, int clipY, int clipH, int nth) {
+    int i, y, per, rem, n;
+    if (!s_hpool.inited) HiresPoolInit(nth - 1);      /* nth-1 workers; this thread works too */
+    n = (nth * 4 < RASTER_MAX_CHUNKS) ? nth * 4 : RASTER_MAX_CHUNKS;
+    if (n > clipH) n = clipH;
+    per = clipH / n; rem = clipH % n; y = clipY;
+    pthread_mutex_lock(&s_hpool.mtx);
+    s_hpool.list = l;
+    for (i = 0; i < n; i++) {
+        int h = per + (i < rem ? 1 : 0);
+        s_hpool.chunkY[i] = y; s_hpool.chunkH[i] = h; y += h;
+    }
+    s_hpool.nchunks = n; s_hpool.next = 0;
+    s_hpool.done = 0; s_hpool.gen++;              /* release workers */
+    pthread_cond_broadcast(&s_hpool.start_cv);
+    pthread_mutex_unlock(&s_hpool.mtx);
+    PoolRunChunks();                              /* this thread claims chunks alongside the workers */
+    pthread_mutex_lock(&s_hpool.mtx);
+    while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
+    pthread_mutex_unlock(&s_hpool.mtx);
+}
+
 void HiresRasterizeThreaded(int clipY, int clipH) {
     int nth = HiresThreadCount();
-    if (!s_hprimCount) return;   /* nothing appended this frame */
+    if (!s_hlist.n) return;   /* nothing appended this frame */
     /* Thread when the frame is heavy. Primitive COUNT is a poor proxy: a fullscreen HD-replaced
      * background is one primitive but millions of expensive per-pixel samples, so also thread whenever
      * an HD replacement is loaded. Cheap non-HD frames keep the single-thread fast path. */
-    if (nth <= 1 || clipH < nth * 2 || (s_hprimCount < 64 && HdReplaceCount() == 0)) { HiresRasterizeBand(clipY, clipH); return; }
+    if (nth <= 1 || clipH < nth * 2 || (s_hlist.n < 64 && HdReplaceCount() == 0)) { HiresRasterizeBand(clipY, clipH); return; }
     (void)AccurateEnabled();                          /* warm the lazy cache before the parallel section */
-    if (!s_hpool.inited) HiresPoolInit(nth - 1);      /* nth-1 workers; the main thread does one band too */
-    {
-        int W = s_hpool.nworkers, total = W + 1;      /* W workers + this thread */
-        int per = clipH / total, rem = clipH % total, y = clipY, i, mainH;
-        pthread_mutex_lock(&s_hpool.mtx);
-        for (i = 0; i < W; i++) {                      /* contiguous bands; workers 0..W-1 then main = last */
-            int h = per + (i < rem ? 1 : 0);
-            s_hpool.band[i].clipY = y; s_hpool.band[i].clipH = h; y += h;
-        }
-        s_hpool.done = 0; s_hpool.gen++;              /* release workers */
-        pthread_cond_broadcast(&s_hpool.start_cv);
-        pthread_mutex_unlock(&s_hpool.mtx);
-        mainH = per + (W < rem ? 1 : 0);
-        HiresRasterizeBand(y, mainH);                 /* this thread's band, in parallel with the workers */
-        pthread_mutex_lock(&s_hpool.mtx);
-        while (s_hpool.done != W) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
-        pthread_mutex_unlock(&s_hpool.mtx);
+    PrimListRasterizeThreaded(&s_hlist, clipY, clipH, nth);
+}
+
+/* ---- Deferred native (1x) pass: on hosts with slow cores (PS Vita) DrawOTag records the native
+ * prims too and rasterizes them banded across the pool. Output is identical to drawing inline: the
+ * prims are replayed in OT order per band, and a frame whose prims sample texture/CLUT data from the
+ * drawing area itself (render-to-texture feedback) falls back to one serial pass. VH_NATIVE_THREADS=0
+ * disables; VH_NATIVE_THREADS=1 enables on any host (default: on for __vita__). */
+int NativeDeferActive(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *v = getenv("VH_NATIVE_THREADS");
+#ifdef __vita__
+        e = (v && v[0] == '0') ? 0 : 1;
+#else
+        e = (v && v[0] == '1') ? 1 : 0;
+#endif
+        if (e && HiresThreadCount() <= 1) e = 0;
+        fprintf(stderr, "[raster] native pass: %s\n", e ? "deferred, multithreaded" : "inline");
     }
+    return e;
+}
+void NativeFrameReset(void) { s_nlist.n = 0; }
+
+static int RectsOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+/* Does any textured prim read texels or CLUT entries from the drawing area? */
+static int NativeListHasFeedback(const PrimList *l, int cx, int cy, int cw, int ch) {
+    int i;
+    for (i = 0; i < l->n; i++) {
+        const HiresPrim *hp = &l->p[i];
+        int tpX, tpY, tp, tw, clutX, clutY;
+        if (!hp->textured) continue;
+        TPageOrigin(hp->tpage, &tpX, &tpY, &tp);
+        tw = (tp == 0) ? 64 : (tp == 1) ? 128 : 256;      /* VRAM halfwords spanned by 256 texels */
+        if (RectsOverlap(tpX, tpY, tw, 256, cx, cy, cw, ch)) return 1;
+        if (tp < 2) {
+            clutX = (hp->clut & 0x3F) * 16; clutY = (hp->clut >> 6) & 0x1FF;
+            if (RectsOverlap(clutX, clutY, tp == 0 ? 16 : 256, 1, cx, cy, cw, ch)) return 1;
+        }
+    }
+    return 0;
+}
+
+void NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH) {
+    static int s_fbLogged = 0;
+    int nth = HiresThreadCount();
+    if (!s_nlist.n) return;
+    (void)AccurateEnabled();                          /* warm the lazy cache before the parallel section */
+    if (nth <= 1 || clipH < nth * 2 || s_nlist.n < 16) {
+        PrimListRasterizeBand(&s_nlist, clipY, clipH);
+    } else if (NativeListHasFeedback(&s_nlist, clipX, clipY, clipW, clipH)) {
+        if (!s_fbLogged) { s_fbLogged = 1; fprintf(stderr, "[raster] texture/draw-area overlap: frame drawn serially\n"); }
+        PrimListRasterizeBand(&s_nlist, clipY, clipH);
+    } else {
+        PrimListRasterizeThreaded(&s_nlist, clipY, clipH, nth);
+    }
+    s_nlist.n = 0;
 }
 
 
@@ -803,7 +917,7 @@ static void PC_MaybeDumpHires(int x, int y, int w, int h) {
 /* ---- walker-facing wrappers (pc_gpu_internal.h) ------------------------------------------------ */
 
 int HiresActive(void) { return HiresWanted() && s_hires != NULL; }
-void HiresFrameReset(void) { s_hprimCount = 0; }   /* reset the per-frame hi-res display list */
+void HiresFrameReset(void) { s_hlist.n = 0; }   /* reset the per-frame hi-res display list */
 
 /* Present the supersampled display region (native units). */
 void HiresPresent(int dispX, int dispY, int dispW, int dispH) {

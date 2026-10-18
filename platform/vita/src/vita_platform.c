@@ -60,6 +60,20 @@ static int VitaFileExists(const char *name) {
     return 1;
 }
 
+static int s_core3 = 0;   /* core 3 usable (core-unlock plugin present) */
+
+/* Raster pool worker `id` (pc_raster.c), called once on the worker thread: worker 0 -> core 1,
+ * 1 -> core 2, 2 -> core 3 when unlocked. Anything beyond floats on the user cores. */
+void PC_VitaRasterWorkerStart(int id) {
+    static const int masks[3] = { SCE_KERNEL_CPU_MASK_USER_1, SCE_KERNEL_CPU_MASK_USER_2,
+                                  SCE_KERNEL_CPU_MASK_SYSTEM };
+    const SceUID tid = sceKernelGetThreadId();
+    if (id < 2 || (id == 2 && s_core3))
+        sceKernelChangeThreadCpuAffinityMask(tid, masks[id]);
+    else
+        sceKernelChangeThreadCpuAffinityMask(tid, SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+}
+
 /* Rear touchpad as the missing L2/R2 (libetc.c PadRead): bit 0 = a touch on the left half,
  * bit 1 = a touch on the right half. The rear panel reports 0..1919 horizontally. */
 int PC_VitaRearTouch(void) {
@@ -105,8 +119,22 @@ __attribute__((constructor(100))) static void VitaEarlyInit(void) {
     }
     atexit(VitaFlushLog);
 
-    /* Main thread on core 0; workers the port creates float on the other user cores. */
-    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+    /* Main thread on core 0. Core 3 is reserved for the system on a stock Vita; core-unlock plugins
+     * (e.g. CapUnlocker) open it to apps, which the affinity call reveals. An empty no_core3 file
+     * in the data folder keeps the port off it. */
+    {
+        const SceUID tid = sceKernelGetThreadId();
+        int r3 = -1;
+        if (!VitaFileExists("no_core3")) {
+            r3 = sceKernelChangeThreadCpuAffinityMask(tid, SCE_KERNEL_CPU_MASK_SYSTEM);
+            s_core3 = (r3 >= 0);
+        }
+        sceKernelChangeThreadCpuAffinityMask(tid, SCE_KERNEL_CPU_MASK_USER_0);
+        /* Raster threads: this one plus one worker per other core (pc_raster.c). */
+        setenv("VH_RASTER_THREADS", s_core3 ? "4" : "3", 0);
+        fprintf(stderr, "[vita] cores: %s -> VH_RASTER_THREADS=%s\n",
+                s_core3 ? "0-3 (core 3 unlocked)" : "0-2", getenv("VH_RASTER_THREADS"));
+    }
 
     fprintf(stderr, "[vita] Vandal Hearts PC port, Vita build " VH_VITA_BUILD " -- data dir: " VH_VITA_DATA_DIR
                     "\n");

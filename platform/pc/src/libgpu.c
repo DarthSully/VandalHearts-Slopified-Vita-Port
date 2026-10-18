@@ -350,6 +350,8 @@ void DrawOTag(unsigned int *p) {
     HiresEnsure();                           /* self-gated: allocates when scale > 1 OR a langpack
                                               * ships localized backgrounds (shadow pass at 1x) */
     HiresFrameReset();                       /* reset the per-frame hi-res display list */
+    const int nativeDefer = NativeDeferActive();   /* record the native pass, rasterize banded below */
+    NativeFrameReset();
     if (s_rtTime < 0) s_rtTime = getenv("VH_RASTER_TIME") ? 1 : 0;
     if (s_rtTime) s_rtStart = clock();
     if (s_primLog < 0) s_primLog = getenv("VH_GPU_PRIM_LOG") ? 1 : 0;
@@ -425,7 +427,7 @@ void DrawOTag(unsigned int *p) {
                 RVert c = { q->x2, q->y2, 0, 0 }, d = { q->x3, q->y3, 0, 0 };
                 PrimLog("F4", 4, q->x0,q->y0, q->x1,q->y1, q->x2,q->y2, q->x3,q->y3,
                         0, 0, semi, s_drawModeAbr, q->r0, q->g0, q->b0);
-                FillQuad(&rcn, a, b, c, d, q->r0, q->g0, q->b0, 0, 0, 0, semi, s_drawModeAbr);
+                (nativeDefer ? NativeAppendQuad : FillQuad)(&rcn, a, b, c, d, q->r0, q->g0, q->b0, 0, 0, 0, semi, s_drawModeAbr);
                 if (hires) HiresAppendQuad(&rch, a, b, c, d, q->r0, q->g0, q->b0, 0, 0, 0, semi, s_drawModeAbr);
                 break;
             }
@@ -435,7 +437,7 @@ void DrawOTag(unsigned int *p) {
                 RVert c = { q->x2, q->y2, q->u2, q->v2 }, d = { q->x3, q->y3, q->u3, q->v3 };
                 PrimLog("FT4", 4, q->x0,q->y0, q->x1,q->y1, q->x2,q->y2, q->x3,q->y3,
                         q->tpage, q->clut, semi, (q->tpage>>5)&3, q->r0, q->g0, q->b0);
-                FillQuad(&rcn, a, b, c, d, q->r0, q->g0, q->b0, 1, q->tpage, q->clut, semi, (q->tpage >> 5) & 3);
+                (nativeDefer ? NativeAppendQuad : FillQuad)(&rcn, a, b, c, d, q->r0, q->g0, q->b0, 1, q->tpage, q->clut, semi, (q->tpage >> 5) & 3);
                 if (hires) HiresAppendQuad(&rch, a, b, c, d, q->r0, q->g0, q->b0, 1, q->tpage, q->clut, semi, (q->tpage >> 5) & 3);
                 break;
             }
@@ -447,7 +449,7 @@ void DrawOTag(unsigned int *p) {
                 RVert d = { s->x0 + s->w, s->y0 + s->h, s->u0 + s->w, s->v0 + s->h };
                 PrimLog("SPRT", 4, s->x0,s->y0, s->x0+s->w,s->y0, s->x0,s->y0+s->h, s->x0+s->w,s->y0+s->h,
                         s_drawModeTPage, s->clut, semi, s_drawModeAbr, s->r0, s->g0, s->b0);
-                FillQuad(&rcn, a, b, c, d, s->r0, s->g0, s->b0, 1, s_drawModeTPage, s->clut, semi, s_drawModeAbr);
+                (nativeDefer ? NativeAppendQuad : FillQuad)(&rcn, a, b, c, d, s->r0, s->g0, s->b0, 1, s_drawModeTPage, s->clut, semi, s_drawModeAbr);
                 if (hires) HiresAppendQuad(&rch, a, b, c, d, s->r0, s->g0, s->b0, 1, s_drawModeTPage, s->clut, semi, s_drawModeAbr);
                 break;
             }
@@ -455,7 +457,7 @@ void DrawOTag(unsigned int *p) {
                 TILE *t = (TILE *)cur;
                 PrimLog("TILE", 4, t->x0,t->y0, t->x0+t->w,t->y0, t->x0,t->y0+t->h, t->x0+t->w,t->y0+t->h,
                         0, 0, 0, 0, t->r0, t->g0, t->b0);
-                FillRect(&rcn, t->x0, t->y0, t->w, t->h, t->r0, t->g0, t->b0);
+                (nativeDefer ? NativeAppendRect : FillRect)(&rcn, t->x0, t->y0, t->w, t->h, t->r0, t->g0, t->b0);
                 if (hires) HiresAppendRect(&rch, t->x0, t->y0, t->w, t->h, t->r0, t->g0, t->b0);
                 break;
             }
@@ -506,6 +508,8 @@ void DrawOTag(unsigned int *p) {
 
     /* Rasterize the deferred hi-res display list (the native pass drew inline above), fanned out
      * across per-band worker threads. */
+    if (nativeDefer)
+        NativeRasterizeFlush(s_drawEnv.clip.x, s_drawEnv.clip.y, s_drawEnv.clip.w, s_drawEnv.clip.h);
     if (HiresActive())
         HiresRasterizeThreaded(s_drawEnv.clip.y, s_drawEnv.clip.h);
 

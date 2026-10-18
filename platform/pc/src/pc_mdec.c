@@ -162,15 +162,25 @@ static void idct_init(void) {
         s_ct[u][x] = cosf((2*x+1)*u*3.14159265358979f/16.0f) * (u==0 ? 0.353553390593f : 0.5f);
 }
 static void idct8x8(float *blk) {   /* in-place, natural order */
+    /* Skips zero coefficients and all-zero rows: they only ever add exact zeros, so the result is the
+     * same as the full sum, at a fraction of the cost (most AC coefficients of an MDEC block are 0). */
     float tmp[64];
-    for (int y = 0; y < 8; y++)                 /* rows */
+    int rowLive[8], nlive = 0, live[8];
+    for (int y = 0; y < 8; y++) {               /* rows */
+        int nz[8], n = 0;
+        for (int u = 0; u < 8; u++) if (blk[y*8+u] != 0.0f) nz[n++] = u;
+        rowLive[y] = (n > 0);
+        if (!n) { for (int x = 0; x < 8; x++) tmp[y*8+x] = 0.0f; continue; }
+        live[nlive++] = y;
         for (int x = 0; x < 8; x++) {
-            float s = 0; for (int u = 0; u < 8; u++) s += s_ct[u][x] * blk[y*8+u];
+            float s = 0; for (int k = 0; k < n; k++) s += s_ct[nz[k]][x] * blk[y*8+nz[k]];
             tmp[y*8+x] = s;
         }
-    for (int x = 0; x < 8; x++)                 /* cols */
+    }
+    (void)rowLive;
+    for (int x = 0; x < 8; x++)                 /* cols: only rows that carry anything */
         for (int y = 0; y < 8; y++) {
-            float s = 0; for (int v = 0; v < 8; v++) s += s_ct[v][y] * tmp[v*8+x];
+            float s = 0; for (int k = 0; k < nlive; k++) s += s_ct[live[k]][y] * tmp[live[k]*8+x];
             blk[y*8+x] = s;
         }
 }
