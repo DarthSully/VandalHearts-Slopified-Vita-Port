@@ -1,3 +1,11 @@
+> **Slopified Vita Port**: an unofficial PS Vita port of
+> **[Vandal Hearts PC Port](https://github.com/HalmyLyseas/VandalHearts-PcPort)** by Halmyrach and
+> contributors, which builds on the **[Vandal Hearts decompilation](https://github.com/shao113/vh)**
+> by shao113. The game code and the PC port are entirely their work; this fork only adds the Vita
+> platform layer (`platform/vita/`, see [its README](platform/vita/README.md)) and `__vita__`-gated
+> changes. Not affiliated with or endorsed by the original authors. GPL-2.0, same as upstream.
+> No game data is included: bring your own disc.
+
 
 
 ![cover-pc-port](docs/images/cover-pc-port.webp)
