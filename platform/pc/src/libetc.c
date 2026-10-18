@@ -271,6 +271,7 @@ int VSync(int mode) {
     /* Answer the compositor's responsiveness ping (and keep close/Ctrl+C live) even inside the
      * game's own VSync wait loops. See docs/pc-port/subsystems/kernel.md, "VSync". */
     { extern void PC_GpuPumpEvents(void); PC_GpuPumpEvents(); }
+    { extern void PC_GpuAsyncService(void); PC_GpuAsyncService(); }   /* present a finished async frame */
 
     int waits = (mode == 0) ? 1 : mode;
     /* Fast-forward resets to 1x on leaving battle, so it never carries into the next battle or an
@@ -286,7 +287,10 @@ int VSync(int mode) {
         Uint32 now = SDL_GetTicks();
         s_nextVBlankMs += totalMs;
         if ((double)now < s_nextVBlankMs) {
-            PC_DiagIdleDelay((unsigned)(s_nextVBlankMs - now));   /* SDL_Delay, timed under VH_FRAME_TIME */
+            /* Idle anyway: finish + present an in-flight async frame first (no-op otherwise). */
+            { extern void PC_GpuAsyncFinish(void); PC_GpuAsyncFinish(); now = SDL_GetTicks(); }
+            if ((double)now < s_nextVBlankMs)
+                PC_DiagIdleDelay((unsigned)(s_nextVBlankMs - now));   /* SDL_Delay, timed under VH_FRAME_TIME */
         } else if ((double)now - s_nextVBlankMs > totalMs) {
             s_nextVBlankMs = (double)now;     /* > one frame behind: genuine stall, resync */
         }

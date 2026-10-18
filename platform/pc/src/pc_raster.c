@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <pthread.h>     /* band-parallel hi-res rasterization (winpthreads on MinGW) */
 
 #include "PsyQ/libgpu.h"
@@ -69,8 +70,12 @@ void PC_GpuSetInternalScale(int s) {
 
 /* Framebuffer-byte + scale accessors for the extracted TUs (pc_gpu_internal.h) -- the trace
  * harness hashes the raw buffers for its regression signature without owning them. */
-const void *PC_GpuVramBytes(size_t *n) { *n = sizeof(s_vram); return s_vram; }
-unsigned short (*PC_GpuVram(void))[VRAM_W] { return s_vram; }
+/* Every VRAM accessor outside the rasterizer first completes any in-flight asynchronous native pass
+ * (libgpu.c, PC_GpuAsyncFinish), so callers always see a finished frame. The present path inside
+ * that completion uses PC_GpuVramRaw. */
+const void *PC_GpuVramBytes(size_t *n) { PC_GpuAsyncFinish(); *n = sizeof(s_vram); return s_vram; }
+unsigned short (*PC_GpuVram(void))[VRAM_W] { PC_GpuAsyncFinish(); return s_vram; }
+unsigned short (*PC_GpuVramRaw(void))[VRAM_W] { return s_vram; }
 const void *PC_GpuHiresBytes(size_t *n) {
     int S = InternalScale();
     if (!s_hires || S <= 1) { *n = 0; return NULL; }
@@ -313,6 +318,70 @@ static void dda_stepy_n(DdaUV *s, const DdaUVStep *st, int n) {
 /* HD asset replacement lives in pc_hdpack.c -- LoadImage and the DDA below are its hooks
  * (HdPack_OnLoad / HdFindTriRegion / HdMaybeDump; seams in pc_gpu_internal.h). */
 
+/* Native-target fast path for one span: the per-pixel decisions of the general loop below (target,
+ * texture page/CLUT/window setup, dither, modulation) hoisted out of the loop. Pixel-identical to the
+ * general path: unmodulated (r=g=b=128) undithered texels pack back to themselves, so they are copied
+ * with the mask bit cleared exactly as PackColor would leave them. Returns 0 to defer to the general
+ * loop (hi-res target, HD replacement, or a clip outside VRAM). */
+static int dda_span_native(const DdaCtx *cx, int y, int x, int width, DdaUV uv) {
+    const RenderCtx *rc = cx->rc;
+    const int dith = AccurateEnabled() && rc->dither;
+    const int accurate = AccurateEnabled();
+    unsigned short *dst;
+#ifdef VH_RASTER_SELFTEST
+    { extern int g_selftestNoFast; if (g_selftestNoFast) return 0; }
+#endif
+    if (rc->target || cx->hdPx || y < 0 || y >= VRAM_H || x < 0 || x + width > VRAM_W) return 0;
+    dst = &s_vram[y][x];
+    if (cx->textured) {
+        int tpX, tpY, tp;
+        const int clutX = (cx->clut & 0x3F) * 16, clutY = (cx->clut >> 6) & 0x1FF;
+        const unsigned short *clutRow = &s_vram[clutY][0];
+        const int uAnd = ~(rc->twMaskX * 8), uOr = (rc->twOffX & rc->twMaskX) * 8;
+        const int vAnd = ~(rc->twMaskY * 8), vOr = (rc->twOffY & rc->twMaskY) * 8;
+        const int plain = !dith && cx->r == 128 && cx->g == 128 && cx->bcol == 128;
+        const unsigned dudx = cx->step.dudx, dvdx = cx->step.dvdx;
+        TPageOrigin(cx->tpage, &tpX, &tpY, &tp);
+        for (; width > 0; width--, x++, dst++, uv.u += dudx, uv.v += dvdx) {
+            int u = (dda_getu(&uv) & uAnd) | uOr, v = (dda_getv(&uv) & vAnd) | vOr;
+            unsigned short texel, c;
+            if (tp == 0) {
+                unsigned short hw = s_vram[tpY + v][tpX + u / 4];
+                texel = clutRow[clutX + ((hw >> ((u % 4) * 4)) & 0xF)];
+            } else if (tp == 1) {
+                unsigned short hw = s_vram[tpY + v][tpX + u / 2];
+                texel = clutRow[clutX + ((u % 2) ? ((hw >> 8) & 0xFF) : (hw & 0xFF))];
+            } else {
+                texel = s_vram[tpY + v][tpX + u];
+            }
+            if (texel == 0) continue;                    /* 0000h = transparent */
+            if (plain) {
+                c = (unsigned short)(texel & 0x7FFF);
+            } else {
+                int tr, tg, tb;
+                UnpackColor(texel, &tr, &tg, &tb);
+                tr = (tr * cx->r) / 128; tg = (tg * cx->g) / 128; tb = (tb * cx->bcol) / 128;
+                c = dith ? PackColorG1Front(tr, tg, tb, x, y) : PackColor(tr, tg, tb);
+            }
+            if (cx->semiTrans && (texel & 0x8000)) WritePixel(dst, x, y, c, cx->abr, 1, 1);
+            else *dst = c;
+        }
+        return 1;
+    }
+    if (!dith) {
+        const unsigned short c = PackColor(cx->r, cx->g, cx->bcol);
+        if (!cx->semiTrans) { for (; width > 0; width--) *dst++ = c; return 1; }
+        if (accurate) {
+            for (; width > 0; width--, dst++) *dst = BlendG1((unsigned)c | 0x8000u, *dst, cx->abr, 0);
+            return 1;
+        }
+    }
+    for (; width > 0; width--, x++, dst++)
+        WritePixel(dst, x, y, dith ? PackColorG1Front(cx->r, cx->g, cx->bcol, x, y)
+                                   : PackColor(cx->r, cx->g, cx->bcol), cx->abr, cx->semiTrans, 0);
+    return 1;
+}
+
 static void dda_span(const DdaCtx *cx, int y, int x_start, int x_bound, DdaUV uv) {
     int width = x_bound - x_start;         /* fill [x_start, x_bound): left-inclusive, right-exclusive */
     int current_x = x_start;
@@ -320,6 +389,7 @@ static void dda_span(const DdaCtx *cx, int y, int x_start, int x_bound, DdaUV uv
     if (current_x + width > cx->clipR + 1) width = cx->clipR + 1 - current_x;
     if (width <= 0) return;
     if (cx->textured) dda_stepx_n(&uv, &cx->step, x_start);   /* seed UV to the span's start x */
+    if (dda_span_native(cx, y, current_x, width, uv)) return;
     {
     do {
         if (cx->textured) {
@@ -723,6 +793,8 @@ static struct {
     const PrimList *list;
     int chunkY[RASTER_MAX_CHUNKS], chunkH[RASTER_MAX_CHUNKS], nchunks;
     int next;       /* next unclaimed chunk (under mtx) */
+    int busy;       /* an asynchronous dispatch is in flight */
+    struct timespec t0, t1;   /* dispatch start / last worker done (async timing) */
     pthread_mutex_t mtx;
     pthread_cond_t start_cv, done_cv;
     unsigned gen;   /* bumped per dispatch */
@@ -758,7 +830,10 @@ static void *HiresPoolWorker(void *arg) {
         pthread_mutex_unlock(&s_hpool.mtx);
         PoolRunChunks();
         pthread_mutex_lock(&s_hpool.mtx);
-        if (++s_hpool.done == s_hpool.nworkers) pthread_cond_signal(&s_hpool.done_cv);
+        if (++s_hpool.done == s_hpool.nworkers) {
+            clock_gettime(CLOCK_MONOTONIC, &s_hpool.t1);
+            pthread_cond_signal(&s_hpool.done_cv);
+        }
         pthread_mutex_unlock(&s_hpool.mtx);
     }
     (void)id;
@@ -776,8 +851,9 @@ static void HiresPoolInit(int nworkers) {
     s_hpool.inited = 1;
 }
 
-/* Rasterize `l` over rows [clipY, clipY+clipH) on the pool plus this thread. */
-static void PrimListRasterizeThreaded(const PrimList *l, int clipY, int clipH, int nth) {
+/* Rasterize `l` over rows [clipY, clipY+clipH) on the pool plus this thread; with `async`, on the
+ * workers only, returning at once (PoolWait completes it). */
+static void PrimListDispatch(const PrimList *l, int clipY, int clipH, int nth, int async) {
     int i, y, per, rem, n;
     if (!s_hpool.inited) HiresPoolInit(nth - 1);      /* nth-1 workers; this thread works too */
     n = (nth * 4 < RASTER_MAX_CHUNKS) ? nth * 4 : RASTER_MAX_CHUNKS;
@@ -790,13 +866,40 @@ static void PrimListRasterizeThreaded(const PrimList *l, int clipY, int clipH, i
         s_hpool.chunkY[i] = y; s_hpool.chunkH[i] = h; y += h;
     }
     s_hpool.nchunks = n; s_hpool.next = 0;
+    clock_gettime(CLOCK_MONOTONIC, &s_hpool.t0);
     s_hpool.done = 0; s_hpool.gen++;              /* release workers */
+    s_hpool.busy = 1;
     pthread_cond_broadcast(&s_hpool.start_cv);
     pthread_mutex_unlock(&s_hpool.mtx);
+    if (async) return;
     PoolRunChunks();                              /* this thread claims chunks alongside the workers */
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
+    s_hpool.busy = 0;
     pthread_mutex_unlock(&s_hpool.mtx);
+}
+static void PrimListRasterizeThreaded(const PrimList *l, int clipY, int clipH, int nth) {
+    PrimListDispatch(l, clipY, clipH, nth, 0);
+}
+
+/* Asynchronous native pass: in flight? done? wait. The wait returns the dispatch-to-finish wall
+ * time in microseconds (for the profile line). */
+int NativeRasterBusy(void) { return s_hpool.busy; }
+int NativeRasterDone(void) {
+    int d;
+    if (!s_hpool.busy) return 1;
+    pthread_mutex_lock(&s_hpool.mtx);
+    d = (s_hpool.done == s_hpool.nworkers);
+    pthread_mutex_unlock(&s_hpool.mtx);
+    return d;
+}
+long NativeRasterWait(void) {
+    if (!s_hpool.busy) return 0;
+    pthread_mutex_lock(&s_hpool.mtx);
+    while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
+    s_hpool.busy = 0;
+    pthread_mutex_unlock(&s_hpool.mtx);
+    return (long)((s_hpool.t1.tv_sec - s_hpool.t0.tv_sec) * 1000000L + (s_hpool.t1.tv_nsec - s_hpool.t0.tv_nsec) / 1000);
 }
 
 void HiresRasterizeThreaded(int clipY, int clipH) {
@@ -852,20 +955,26 @@ static int NativeListHasFeedback(const PrimList *l, int cx, int cy, int cw, int 
     return 0;
 }
 
-void NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH) {
+/* Async-capable flush: returns 1 when the pass was dispatched to the workers and is still running
+ * (the list must not be touched until NativeRasterWait), 0 when it completed synchronously. */
+int NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH, int async) {
     static int s_fbLogged = 0;
     int nth = HiresThreadCount();
-    if (!s_nlist.n) return;
+    if (!s_nlist.n) return 0;
     (void)AccurateEnabled();                          /* warm the lazy cache before the parallel section */
     if (nth <= 1 || clipH < nth * 2 || s_nlist.n < 16) {
         PrimListRasterizeBand(&s_nlist, clipY, clipH);
     } else if (NativeListHasFeedback(&s_nlist, clipX, clipY, clipW, clipH)) {
         if (!s_fbLogged) { s_fbLogged = 1; fprintf(stderr, "[raster] texture/draw-area overlap: frame drawn serially\n"); }
         PrimListRasterizeBand(&s_nlist, clipY, clipH);
+    } else if (async && nth > 1) {
+        PrimListDispatch(&s_nlist, clipY, clipH, nth, 1);
+        return 1;                                 /* list stays live until NativeRasterWait */
     } else {
         PrimListRasterizeThreaded(&s_nlist, clipY, clipH, nth);
     }
     s_nlist.n = 0;
+    return 0;
 }
 
 

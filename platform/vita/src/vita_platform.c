@@ -172,6 +172,8 @@ __attribute__((constructor(100))) static void VitaEarlyInit(void) {
     if (VitaFileExists("profile")) {
         setenv("VH_PRESENT_TIME", "1", 0);
         setenv("VH_RASTER_TIME", "1", 0);
+        setenv("VH_FRAME_TIME", "1", 0);
+        setenv("VH_FPS_LOG", "1", 0);
         fprintf(stderr, "[vita] profile: present/raster timing on\n");
     }
 }

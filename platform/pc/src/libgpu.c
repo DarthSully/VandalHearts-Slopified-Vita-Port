@@ -53,7 +53,7 @@ int ResetGraph(int mode) {
 
 int SetGraphDebug(int level) { (void)level; return 0; }
 void SetDispMask(int mask) { (void)mask; }
-int DrawSync(int mode) { (void)mode; return 0; } /* rasterization is synchronous -- nothing to wait for */
+int DrawSync(int mode) { (void)mode; PC_GpuAsyncFinish(); return 0; } /* completes an async native pass */
 
 DISPENV *SetDefDispEnv(DISPENV *env, int x, int y, int w, int h) {
     memset(env, 0, sizeof(*env));
@@ -180,6 +180,7 @@ int MoveImage(RECT *rect, int x, int y) {
 }
 
 int ClearImage(RECT *rect, u_char r, u_char g, u_char b) {
+    PC_GpuAsyncFinish();
     { unsigned char rgb[3]; rgb[0] = r; rgb[1] = g; rgb[2] = b; TrcWrite('C', rect, 8, rgb, 3); }
     FillRectRaw(rect->x, rect->y, rect->w, rect->h, r, g, b);
     return 0;
@@ -336,6 +337,63 @@ static void PC_MaybeDumpVram(void) {
     PC_WriteVramPpm(s_dumped++);
 }
 
+/* ---- Asynchronous native pass (PS Vita by default; VH_RASTER_ASYNC). DrawOTag records the frame,
+ * dispatches its rasterization to the worker pool and returns, so the game's next tick overlaps the
+ * drawing. The frame is presented as soon as it is done: VSync polls for that without blocking, and
+ * anything that touches VRAM (or the next DrawOTag) completes it first. */
+static int s_asyncPending = 0;            /* a native pass is in flight */
+static int s_presentPending = 0;          /* a finished-or-in-flight frame still to present */
+static DISPENV s_presentDisp;             /* DISPENV captured at that frame's DrawOTag */
+static int s_asyncProf = -1; static double s_asyncWaitMs, s_asyncRasterMs; static unsigned s_asyncN;
+
+static int RasterAsyncEnabled(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *v = getenv("VH_RASTER_ASYNC");
+#ifdef __vita__
+        e = (v && v[0] == '0') ? 0 : 1;
+#else
+        e = (v && v[0] == '1') ? 1 : 0;
+#endif
+        fprintf(stderr, "[raster] async native pass: %s\n", e ? "on" : "off");
+    }
+    return e;
+}
+
+static void PresentDispEnv(const DISPENV *d) {
+    unsigned short (*vram)[VRAM_W] = PC_GpuVramRaw();
+    PC_GpuPresent(&vram[0][0], VRAM_W, VRAM_H, d->disp.x, d->disp.y, d->disp.w, d->disp.h);
+}
+
+void PC_GpuAsyncFinish(void) {
+    if (s_asyncPending) {
+        double t0 = 0;
+        long rasterUs;
+        if (s_asyncProf < 0) s_asyncProf = getenv("VH_RASTER_TIME") ? 1 : 0;
+        if (s_asyncProf) t0 = (double)clock() / CLOCKS_PER_SEC * 1000.0;
+        rasterUs = NativeRasterWait();
+        s_asyncPending = 0;
+        NativeFrameReset();
+        if (s_asyncProf) {
+            s_asyncWaitMs += (double)clock() / CLOCKS_PER_SEC * 1000.0 - t0;
+            s_asyncRasterMs += rasterUs / 1000.0;
+            if (++s_asyncN >= 120) {
+                fprintf(stderr, "[raster] async: raster %.2f ms/frame on the workers, main waited %.2f ms/frame (%u frames)\n",
+                        s_asyncRasterMs / s_asyncN, s_asyncWaitMs / s_asyncN, s_asyncN);
+                s_asyncWaitMs = s_asyncRasterMs = 0; s_asyncN = 0;
+            }
+        }
+    }
+    if (s_presentPending) {
+        s_presentPending = 0;
+        PresentDispEnv(&s_presentDisp);
+    }
+}
+
+void PC_GpuAsyncService(void) {
+    if (s_presentPending && (!s_asyncPending || NativeRasterDone())) PC_GpuAsyncFinish();
+}
+
 void DrawOTag(unsigned int *p) {
     /* VH_GPU_PRIM_LOG=1: dump anomalous primitives (SetSemiTrans 0x80 bit set, or a code that decodes
      * to an unrecognized type), e.g. effect polys that call SetSemiTrans without SetPolyFT4. Env read once. */
@@ -349,6 +407,7 @@ void DrawOTag(unsigned int *p) {
     if (s_tileLogReq) { s_tileLogFrame = s_drawFrame; s_tileLogReq = 0; }
     HiresEnsure();                           /* self-gated: allocates when scale > 1 OR a langpack
                                               * ships localized backgrounds (shadow pass at 1x) */
+    PC_GpuAsyncFinish();                     /* previous frame: finish drawing and present it */
     HiresFrameReset();                       /* reset the per-frame hi-res display list */
     const int nativeDefer = NativeDeferActive();   /* record the native pass, rasterize banded below */
     NativeFrameReset();
@@ -508,8 +567,10 @@ void DrawOTag(unsigned int *p) {
 
     /* Rasterize the deferred hi-res display list (the native pass drew inline above), fanned out
      * across per-band worker threads. */
+    int asyncKicked = 0;
     if (nativeDefer)
-        NativeRasterizeFlush(s_drawEnv.clip.x, s_drawEnv.clip.y, s_drawEnv.clip.w, s_drawEnv.clip.h);
+        asyncKicked = NativeRasterizeFlush(s_drawEnv.clip.x, s_drawEnv.clip.y, s_drawEnv.clip.w, s_drawEnv.clip.h,
+                                           RasterAsyncEnabled() && !HiresActive());
     if (HiresActive())
         HiresRasterizeThreaded(s_drawEnv.clip.y, s_drawEnv.clip.h);
 
@@ -520,6 +581,12 @@ void DrawOTag(unsigned int *p) {
         if (++s_rtFrames >= 120) { fprintf(stderr, "[raster] scale=%d  mean %.0f us/frame CPU (%u frames)\n",
             hiScale, (double)s_rtAccum / CLOCKS_PER_SEC * 1e6 / s_rtFrames, s_rtFrames); s_rtAccum = 0; s_rtFrames = 0; } }
     PC_UpdateCamOsd(); /* refresh the debug pose label to match this frame (VH_CAM_OSD) */
+    if (asyncKicked) {                     /* present once drawn: VSync, VRAM access or next DrawOTag */
+        s_asyncPending = 1;
+        s_presentPending = 1;
+        s_presentDisp = s_dispEnv;
+        return;
+    }
     PC_MaybeDumpVram(); /* VH_VRAM_DUMP=N: snapshot VRAM to PPM for texture/CLUT triage */
     if (HiresActive()) {                   /* present the supersampled display region */
         HiresPresent(s_dispEnv.disp.x, s_dispEnv.disp.y, s_dispEnv.disp.w, s_dispEnv.disp.h);

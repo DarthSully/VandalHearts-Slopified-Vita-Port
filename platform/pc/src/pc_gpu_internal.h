@@ -61,7 +61,13 @@ void NativeFrameReset(void);
 void NativeAppendQuad(const RenderCtx *rcn, RVert a, RVert b, RVert c, RVert d,
                       int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr);
 void NativeAppendRect(const RenderCtx *rcn, int x, int y, int w, int h, int r, int g, int b);
-void NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH);
+void PC_GpuAsyncFinish(void);    /* complete an in-flight async native pass and present it */
+void PC_GpuAsyncService(void);   /* same, only if it already finished (non-blocking) */
+int  NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH, int async);
+int  NativeRasterBusy(void);
+int  NativeRasterDone(void);
+long NativeRasterWait(void);   /* -> dispatch-to-finish microseconds */
+unsigned short (*PC_GpuVramRaw(void))[PC_GPU_VRAM_W];   /* no async completion (present path) */
 int  HiresActive(void);                                        /* scale > 1 and the buffer exists */
 void HiresPresent(int dispX, int dispY, int dispW, int dispH); /* edge-clamp + dump hook + present */
 extern volatile sig_atomic_t g_vhHiresDumpReq;   /* SIGUSR2 latch: dump the hires pair this frame */
