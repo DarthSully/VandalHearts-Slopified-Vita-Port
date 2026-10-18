@@ -3,7 +3,7 @@
 Read this first when resuming work on the Vita port. Player-facing install/controls are in
 [README.md](README.md); this file is for whoever continues the work.
 
-## State (build r06)
+## State (build r07)
 
 - Base: HalmyLyseas/VandalHearts-PcPort `14552ff` (v2.1.0 + packaging fix). The port is the
   `vita` branch: one commit per build, `git log 14552ff..vita`.
@@ -48,15 +48,20 @@ platform/vita/build.sh "<disc>.bin" <KROMDAT.BIN | PS1 BIOS | charset2_us.bin> r
 | r03 | touch toggles (stretch, fast-forward) | - |
 | r04 | span fast path, async raster | battle 18-25 fps; main thread ~27 ms of non-raster work |
 | r05 | division-free reverb, inline lrintf | battle 25-30 fps; seq+spu 5-14 ms; MDEC 34 ms/frame |
-| r06 | VSync never blocks on drawing; MDEC across the pool | (pending) |
+| r06 | VSync never blocks on drawing; MDEC across the pool | battle ~27-30 fps (main: ~14 ms raster wait + ~12 ms SPU, serial); FMV 35 ticks/s, MDEC 14.5 ms |
+| r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | (pending) |
 
 ## Where the time still goes / next ideas
 
+0. r07 removed: `Movie_SyncFrame`'s `WAIT_TIME` spin (~10-19 ms per movie tick on the A9, the MDEC
+   callback never fires on PC); the serial raster wait (DrawSync now runs the audio pump while the
+   workers draw, then the main thread claims the remaining bands).
 1. **SPU on the main thread** (`PC_SeqTick` -> `PC_SpuService`): 3-14 ms per VSync, heaviest with
    many voices + reverb. Moving rendering to its own thread needs care: libsnd mutates voice state
    from the game thread and the sequencer is clocked by rendered samples. Per-voice float math in
    `SpuRenderBlock` is the other lever.
-2. **MDEC bitstream parse** stays serial (`br_bit` per bit); a 32-bit refill bit reader would help.
+2. **MDEC bitstream parse** stays serial, now with a 32-bit reader and an 11-bit AC lookup table
+   (identical output vs r06 on 6000 random/structured v2+v3 streams).
 3. Native widescreen is not available upstream; battles (3D) are the only candidate (projection
    width, off-screen culling, HUD layout). The stretch toggle is the stopgap.
 

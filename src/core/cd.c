@@ -1357,7 +1357,13 @@ u32 *Movie_GetNextFrame(void) {
 }
 
 void Movie_SyncFrame(void) {
+#ifdef PC_PORT
+   /* The PC MDEC decodes synchronously and never fires the slice callback: take the timeout path
+    * at once instead of spinning WAIT_TIME iterations every movie tick (same end state). */
+   s32 tries = 1;
+#else
    s32 tries = WAIT_TIME;
+#endif
 
    while (!gMovieDecoder.frameFinished) {
       if (--tries == 0) {

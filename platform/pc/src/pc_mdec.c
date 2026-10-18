@@ -13,21 +13,34 @@ typedef unsigned int   u32;
 typedef short          s16;
 
 /* ---------------- bit reader (halfword LE, MSB-first within each 16-bit) ------------- */
-typedef struct { const u8 *p; int nbytes; int hwIdx; int bit; u16 cur; } BitR;
+/* 32-bit accumulator: `acc` holds `cnt` unread bits MSB-aligned, refilled a halfword at a time.
+ * Out-of-data behaviour matches a bit-at-a-time reader: br_bit returns -1 once every halfword whose
+ * both bytes exist has been consumed. */
+typedef struct { const u8 *p; int nbytes; int hwIdx; u32 acc; int cnt; } BitR;
 static void br_init(BitR *b, const u8 *data, int nbytes) {
-    b->p = data; b->nbytes = nbytes; b->hwIdx = 0; b->bit = -1; b->cur = 0;
+    b->p = data; b->nbytes = nbytes; b->hwIdx = 0; b->acc = 0; b->cnt = 0;
 }
-static int br_bit(BitR *b) {
-    if (b->bit < 0) {
+static inline void br_fill(BitR *b) {
+    while (b->cnt <= 16) {
         int o = b->hwIdx * 2;
-        if (o + 1 >= b->nbytes) return -1;           /* out of data */
-        b->cur = (u16)(b->p[o] | (b->p[o+1] << 8));   /* little-endian halfword */
-        b->hwIdx++; b->bit = 15;
+        if (o + 1 >= b->nbytes) break;
+        b->acc |= (u32)(b->p[o] | (b->p[o+1] << 8)) << (16 - b->cnt);   /* little-endian halfword */
+        b->cnt += 16; b->hwIdx++;
     }
-    return (b->cur >> (b->bit--)) & 1;
 }
-static int br_bits(BitR *b, int n) {
+static inline int br_bit(BitR *b) {
+    int v;
+    if (b->cnt == 0) { br_fill(b); if (b->cnt == 0) return -1; }
+    v = (int)(b->acc >> 31); b->acc <<= 1; b->cnt--;
+    return v;
+}
+static int br_bits(BitR *b, int n) {           /* 1 <= n <= 16 */
     int v = 0;
+    if (b->cnt < n) br_fill(b);
+    if (b->cnt >= n) {
+        v = (int)(b->acc >> (32 - n)); b->acc <<= n; b->cnt -= n;
+        return v;
+    }
     while (n--) { int bit = br_bit(b); if (bit < 0) return -1; v = (v << 1) | bit; }
     return v;
 }
@@ -114,6 +127,35 @@ static int ac_next(BitR *b) {
     #undef SIGNED10
 }
 
+/* Table-driven AC decode: every code of up to AC_FAST_BITS bits (sign included) is looked up from
+ * the next AC_FAST_BITS bits; longer codes, escapes and the end of the stream take ac_next. The
+ * table is built by running ac_next itself on each prefix, so the two cannot disagree. */
+#define AC_FAST_BITS 11
+static int s_acVal[1 << AC_FAST_BITS];
+static u8  s_acLen[1 << AC_FAST_BITS];
+static void ac_table_init(void) {
+    for (int v = 0; v < (1 << AC_FAST_BITS); v++) {
+        u8 d[4] = {0, 0, 0, 0};
+        u32 hw = (u32)v << (16 - AC_FAST_BITS);
+        BitR b; int r, used;
+        d[0] = (u8)hw; d[1] = (u8)(hw >> 8);
+        br_init(&b, d, 4);
+        r = ac_next(&b);
+        used = b.hwIdx * 16 - b.cnt;
+        s_acLen[v] = (r != AC_ERR && used <= AC_FAST_BITS) ? (u8)used : 0;
+        s_acVal[v] = r;
+    }
+}
+static inline int ac_fast(BitR *b) {
+    if (b->cnt < AC_FAST_BITS) br_fill(b);
+    if (b->cnt >= AC_FAST_BITS) {
+        const u32 k = b->acc >> (32 - AC_FAST_BITS);
+        const int len = s_acLen[k];
+        if (len) { b->acc <<= len; b->cnt -= len; return s_acVal[k]; }
+    }
+    return ac_next(b);
+}
+
 /* ---------------- DC decoders -------------------------------------------------------- */
 /* v2: direct signed 10-bit DC; +0x1FF (0111111111) => end of frame */
 static int dc_v2(BitR *b, int *eof) {
@@ -192,11 +234,11 @@ static void idct8x8(float *blk) {   /* in-place, natural order */
 /* Decode one block's dequantized coefficients into `out` (natural order); the IDCT is left to the
  * caller (MdecAssembleMB), so it can run in parallel with other macroblocks. */
 static int decode_block(BitR *b, int dcCoef, int qScale, float *out) {
-    float blk[64]; for (int i = 0; i < 64; i++) blk[i] = 0;
-    blk[0] = (float)(dcCoef * QUANT[0]);        /* DC: *qt[0] (=2), no qscale */
+    memset(out, 0, 64 * sizeof(float));
+    out[0] = (float)(dcCoef * QUANT[0]);        /* DC: *qt[0] (=2), no qscale */
     int k = 0;
     for (;;) {
-        int code = ac_next(b);
+        int code = ac_fast(b);
         if (code == AC_EOB) break;
         if (code == AC_ERR) return -1;
         int esc = (code >> 30) & 1;
@@ -211,9 +253,8 @@ static int decode_block(BitR *b, int dcCoef, int qScale, float *out) {
         int v   = (int)(((unsigned)mag * qScale * QUANT[p]) >> 3);
         if (esc) v = (v - 1) | 1;
         if (lev < 0) v = -v;
-        blk[p] = (float)v;
+        out[p] = (float)v;
     }
-    memcpy(out, blk, sizeof(blk));
     return 0;
 }
 
@@ -278,7 +319,7 @@ int PC_MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, u
     return r;
 }
 static int MdecDecodeBS(const unsigned char *bs, int bsLen, int width, int height, unsigned short *outBGR555) {
-    if (!s_idctReady) { idct_init(); s_idctReady = 1; }
+    if (!s_idctReady) { idct_init(); ac_table_init(); s_idctReady = 1; }
     if (bsLen < 8) return -1;
     u16 id      = (u16)(bs[2] | (bs[3]<<8));
     int qScale  = (u16)(bs[4] | (bs[5]<<8)) & 0x3f;

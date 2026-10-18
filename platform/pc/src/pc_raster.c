@@ -861,7 +861,7 @@ static void HiresPoolInit(int nworkers) {
 static void PrimListDispatch(const PrimList *l, int clipY, int clipH, int nth, int async) {
     int i, y, per, rem, n;
     if (!s_hpool.inited) HiresPoolInit(nth - 1);      /* nth-1 workers; this thread works too */
-    n = (nth * 4 < RASTER_MAX_CHUNKS) ? nth * 4 : RASTER_MAX_CHUNKS;
+    n = (nth * 6 < RASTER_MAX_CHUNKS) ? nth * 6 : RASTER_MAX_CHUNKS;   /* small chunks: even tails */
     if (n > clipH) n = clipH;
     per = clipH / n; rem = clipH % n; y = clipY;
     pthread_mutex_lock(&s_hpool.mtx);
@@ -923,6 +923,7 @@ int NativeRasterDone(void) {
 }
 long NativeRasterWait(void) {
     if (!s_hpool.busy) return 0;
+    if (!s_hpool.fn) PoolRunChunks();   /* draw the bands nobody has claimed yet instead of idling */
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
     s_hpool.busy = 0;

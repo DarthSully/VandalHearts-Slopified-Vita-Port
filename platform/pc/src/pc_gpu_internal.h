@@ -62,6 +62,7 @@ void NativeAppendQuad(const RenderCtx *rcn, RVert a, RVert b, RVert c, RVert d,
                       int r, int g, int bcol, int textured, int tpage, int clut, int semi, int abr);
 void NativeAppendRect(const RenderCtx *rcn, int x, int y, int w, int h, int r, int g, int b);
 void PC_GpuAsyncFinish(void);    /* complete an in-flight async native pass and present it */
+int PC_GpuAsyncInFlight(void);   /* an async native pass is pending */
 void PC_GpuAsyncService(void);   /* same, only if it already finished (non-blocking) */
 int  NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH, int async);
 int  NativeRasterBusy(void);

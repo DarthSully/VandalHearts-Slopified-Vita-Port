@@ -251,6 +251,36 @@ unsigned int PadRead(int id) {
     return PC_OverlayFilterPad(p1);   /* chord/overlay input filter */
 }
 
+/* The per-VSync audio pumps: XA streaming and the SEQ sequencer + software SPU render. Normally run
+ * from VSync; DrawSync runs them early (PC_AudioPumpEarly) while an asynchronous raster pass is still
+ * drawing, so the two overlap. At most once per VSync either way. */
+static int s_audioPumped = 0;
+static void PC_AudioPump(void) {
+    static int on = -1; static double xaMs, seqMs; static int n;
+    Uint64 t0 = 0, t1 = 0, t2 = 0;
+    extern void PC_CdXaUpdate(void);
+    extern void PC_SeqTick(void);
+    if (on < 0) on = getenv("VH_FRAME_TIME") ? 1 : 0;   /* VH_FRAME_TIME=1: the pumps' share */
+    if (on) t0 = SDL_GetPerformanceCounter();
+    PC_CdXaUpdate();   /* XA music streaming pump */
+    if (on) t1 = SDL_GetPerformanceCounter();
+    PC_SeqTick();      /* SEQ (sequenced music) sequencer + software SPU render */
+    if (on) {
+        double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        t2 = SDL_GetPerformanceCounter();
+        xaMs += (double)(t1 - t0) * f; seqMs += (double)(t2 - t1) * f;
+        if (++n >= 120) {
+            fprintf(stderr, "[audio] main thread per VSync: xa=%.2f ms, seq+spu=%.2f ms (%d)\n", xaMs / n, seqMs / n, n);
+            xaMs = seqMs = 0; n = 0;
+        }
+    }
+}
+void PC_AudioPumpEarly(void) {
+    if (s_audioPumped || !s_vsyncInitialized) return;
+    s_audioPumped = 1;
+    PC_AudioPump();
+}
+
 int VSync(int mode) {
     if (!s_vsyncInitialized) {
         s_nextVBlankMs = (double)SDL_GetTicks();
@@ -303,26 +333,8 @@ int VSync(int mode) {
 
     PC_DiagVSyncRows();   /* the VH_*_LOG per-tick CSV rows (pc_diag.c) */
 
-    {   /* VH_FRAME_TIME=1: the audio pumps' share of the main thread, per VSync. */
-        static int on = -1; static double xaMs, seqMs; static int n;
-        Uint64 t0 = 0, t1 = 0, t2 = 0;
-        extern void PC_CdXaUpdate(void);
-        extern void PC_SeqTick(void);
-        if (on < 0) on = getenv("VH_FRAME_TIME") ? 1 : 0;
-        if (on) t0 = SDL_GetPerformanceCounter();
-        PC_CdXaUpdate();   /* XA music streaming pump */
-        if (on) t1 = SDL_GetPerformanceCounter();
-        PC_SeqTick();      /* SEQ (sequenced music) sequencer + software SPU render */
-        if (on) {
-            double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
-            t2 = SDL_GetPerformanceCounter();
-            xaMs += (double)(t1 - t0) * f; seqMs += (double)(t2 - t1) * f;
-            if (++n >= 120) {
-                fprintf(stderr, "[audio] main thread per VSync: xa=%.2f ms, seq+spu=%.2f ms (%d)\n", xaMs / n, seqMs / n, n);
-                xaMs = seqMs = 0; n = 0;
-            }
-        }
-    }
+    if (!s_audioPumped) PC_AudioPump();   /* unless DrawSync already ran it during drawing */
+    s_audioPumped = 0;
 
     /* GPU-trace recording, battle-gated (VH_GPU_RECORD_BATTLE=1): arm the recorder from the same
      * battle-state set the fast-forward gate uses, so a trace captures pure battle content. */

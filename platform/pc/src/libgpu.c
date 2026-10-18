@@ -53,7 +53,16 @@ int ResetGraph(int mode) {
 
 int SetGraphDebug(int level) { (void)level; return 0; }
 void SetDispMask(int mask) { (void)mask; }
-int DrawSync(int mode) { (void)mode; PC_GpuAsyncFinish(); return 0; } /* completes an async native pass */
+/* Completes an async native pass. While it is still drawing, this frame's audio pump runs first so
+ * the SPU render overlaps the workers instead of following them. */
+int DrawSync(int mode) {
+    extern int NativeRasterDone(void);
+    extern void PC_AudioPumpEarly(void);
+    (void)mode;
+    if (PC_GpuAsyncInFlight() && !NativeRasterDone()) PC_AudioPumpEarly();
+    PC_GpuAsyncFinish();
+    return 0;
+}
 
 DISPENV *SetDefDispEnv(DISPENV *env, int x, int y, int w, int h) {
     memset(env, 0, sizeof(*env));
@@ -389,6 +398,8 @@ void PC_GpuAsyncFinish(void) {
         PresentDispEnv(&s_presentDisp);
     }
 }
+
+int PC_GpuAsyncInFlight(void) { return s_asyncPending; }
 
 void PC_GpuAsyncService(void) {
     if (s_presentPending && (!s_asyncPending || NativeRasterDone())) PC_GpuAsyncFinish();

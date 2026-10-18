@@ -91,5 +91,8 @@ Requirements: VitaSDK with SDL2 for Vita (2.32 tested), cmake, python3. Builds a
 - **Direct present**: BGR555 -> ABGR8888 through a LUT straight into a streaming texture.
 - **Division-free SPU reverb** (`pc_spu.c`): the A9 has no divide instruction; `%` and 64-bit
   `/0x8000` replaced with exact equivalents (bit-identical over 2M samples).
+- **Audio during drawing**: DrawSync runs the frame's XA/SPU pump while the workers are still
+  drawing; the main thread then draws the bands left unclaimed.
+- **Movies**: no spin-wait for the (never-fired) MDEC callback; table-driven AC decode.
 - **MDEC**: sparse IDCT, inline `vcvtr` rounding, and a serial-parse / parallel-assemble split across
   the pool (`tools/mdec_selftest.c`: identical output).
