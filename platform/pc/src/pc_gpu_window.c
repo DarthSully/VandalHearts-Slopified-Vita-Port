@@ -785,6 +785,19 @@ static Uint32 s_lut555[32768];
 static SDL_Texture *s_fastTex;
 static int s_fastW, s_fastH;
 
+/* Stretch-to-fill (Vita): the 4:3 frame scaled to the whole 16:9 screen. Toggled by a front-touch
+ * double tap on the right half (libetc.c), persisted as VH_VITA_STRETCH in vandalhearts.ini. */
+static int s_stretch = -1;
+static int VitaStretch(void) {
+    if (s_stretch < 0) { const char *e = getenv("VH_VITA_STRETCH"); s_stretch = (e && e[0] == '1'); }
+    return s_stretch;
+}
+void PC_GpuToggleStretch(void) {
+    s_stretch = !VitaStretch();
+    PC_SaveIniConfig("video", "VH_VITA_STRETCH", s_stretch ? "1" : "0");
+    fprintf(stderr, "[vita] picture: %s\n", s_stretch ? "stretched to 16:9" : "4:3");
+}
+
 static void VitaPresentDirect(const unsigned short *vram, int vramW, int x, int y, int w, int h) {
     static int lutReady = 0;
     void *pixels;
@@ -818,10 +831,24 @@ static void VitaPresentDirect(const unsigned short *vram, int vramW, int x, int 
     SDL_GetRendererOutputSize(s_renderer, &winW, &winH);
     vpW = winW; vpH = (int)((float)winW * h / w + 0.5f);
     if (vpH > winH) { vpH = winH; vpW = (int)((float)winH * w / h + 0.5f); }
+    if (VitaStretch()) { vpW = winW; vpH = winH; }
     dst.x = (winW - vpW) / 2; dst.y = (winH - vpH) / 2; dst.w = vpW; dst.h = vpH;
     SDL_SetRenderDrawColor(s_renderer, 0, 0, 0, 255);
     SDL_RenderClear(s_renderer);
     SDL_RenderCopy(s_renderer, s_fastTex, NULL, &dst);
+    {   /* Battle fast-forward: two small ">" marks top-right (the text tag needs the slow path). */
+        extern int PC_BattleSpeedGet(void);
+        if (PC_BattleSpeedGet() > 1) {
+            int k, i, x0 = winW - 52, y0 = 10;
+            SDL_SetRenderDrawColor(s_renderer, 255, 255, 255, 255);
+            for (k = 0; k < 2; k++)
+                for (i = 0; i < 10; i++) {
+                    SDL_Rect r;
+                    r.x = x0 + k * 20 + (i < 5 ? i : 9 - i) * 2; r.y = y0 + i * 2; r.w = 4; r.h = 2;
+                    SDL_RenderFillRect(s_renderer, &r);
+                }
+        }
+    }
     SDL_RenderPresent(s_renderer);
 }
 #endif
@@ -865,7 +892,7 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
         extern int PC_BattleSpeedGet(void);
         int osd = getenv("VH_CAM_OSD") != NULL && g_camOsdText[0];
         int subs = (s_movieOverlay != NULL) && msubs > 1;
-        if (!s_movieOverlayRGB && !subs && !osd && !PC_OverlayIsOpen() && PC_BattleSpeedGet() <= 1) {
+        if (!s_movieOverlayRGB && !subs && !osd && !PC_OverlayIsOpen()) {
             VitaPresentDirect(vram, vramW, x, y, w, h);
             if (s_ptTime) {
                 double t = presentNowMs();
@@ -974,6 +1001,9 @@ void PC_GpuPresent(unsigned short *vram, int vramW, int vramH,
         vpW = winW;
         vpH = (int)(winW / srcAspect + 0.5f);
         if (vpH > winH) { vpH = winH; vpW = (int)(winH * srcAspect + 0.5f); }
+#if defined(__vita__)
+        if (VitaStretch()) { vpW = winW; vpH = winH; }
+#endif
         vpX = (winW - vpW) / 2;
         vpY = (winH - vpH) / 2;
 

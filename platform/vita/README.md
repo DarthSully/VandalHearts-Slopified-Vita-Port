@@ -19,8 +19,14 @@ The PC port's gamepad layout ([docs/controls.md](../../docs/controls.md)), posit
 Cross = cancel, Circle = confirm, Triangle = map view, Square = threat overlay, L/R = cycle units,
 right stick = camera, **Select + Start** = options overlay.
 
-The Vita has no L2/R2, so battle fast-forward is on the **rear touchpad**: touch the right half for
-2x, the left half for normal speed.
+The Vita has no L2/R2, so battle fast-forward is on the touch surfaces:
+
+- **Double-tap the left half of the screen**: toggle battle fast-forward (2x / normal). Battle only,
+  as on PC; two small arrows top-right show it's on.
+- **Double-tap the right half of the screen**: toggle stretching the 4:3 picture to fill the 16:9
+  screen (saved as `VH_VITA_STRETCH` in `vandalhearts.ini`). The game renders a fixed 320x240 frame,
+  so this widens the picture rather than showing more of the map.
+- Rear touchpad: right half = 2x, left half = normal speed.
 
 ## Switch files
 

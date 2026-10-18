@@ -90,6 +90,35 @@ int PC_VitaRearTouch(void) {
     return bits;
 }
 
+/* Front touchscreen double taps (libetc.c PadRead): returns bit 0 once for a double tap on the left
+ * half, bit 1 once for a double tap on the right half. A double tap = two touch-downs on the same
+ * half within 350 ms. The front panel reports 0..1919 horizontally. */
+int PC_VitaFrontDoubleTaps(void) {
+    static int s_init = 0, s_wasDown = 0, s_lastSide = -1;
+    static SceUInt64 s_lastTapUs = 0;
+    SceTouchData td;
+    int events = 0, down;
+    if (!s_init) {
+        sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+        s_init = 1;
+    }
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &td, 1) < 1) return 0;
+    down = td.reportNum > 0;
+    if (down && !s_wasDown) {                       /* touch-down edge */
+        const int side = (td.report[0].x < 960) ? 0 : 1;
+        const SceUInt64 now = sceKernelGetProcessTimeWide();
+        if (side == s_lastSide && now - s_lastTapUs < 350000) {
+            events |= 1 << side;
+            s_lastSide = -1;                        /* a third tap starts a new pair */
+        } else {
+            s_lastSide = side;
+            s_lastTapUs = now;
+        }
+    }
+    s_wasDown = down;
+    return events;
+}
+
 #pragma GCC diagnostic ignored "-Wprio-ctor-dtor"
 __attribute__((constructor(100))) static void VitaEarlyInit(void) {
     SceAppUtilInitParam init;

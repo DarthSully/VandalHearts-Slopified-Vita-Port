@@ -231,6 +231,16 @@ unsigned int PadRead(int id) {
         if (rt & 1) p1 |= (unsigned)PADL2 << 16;
         if (rt & 2) p1 |= (unsigned)PADR2 << 16;
     }
+    /* Front touchscreen double taps: left half toggles battle fast-forward (a pad-2 R2 or L2 tap),
+     * right half toggles stretching the picture to fill the screen (pc_gpu_window.c). */
+    {
+        extern int PC_VitaFrontDoubleTaps(void);
+        extern int PC_BattleSpeedRaw(void);
+        extern void PC_GpuToggleStretch(void);
+        int dt = PC_VitaFrontDoubleTaps();
+        if (dt & 1) p1 |= (unsigned)(PC_BattleSpeedRaw() > 1 ? PADL2 : PADR2) << 16;
+        if (dt & 2) PC_GpuToggleStretch();
+    }
 #endif
 
     p1 |= PC_SmokePadHold();   /* VH_SMOKE boot harness: hold START through the intro movies (pc_diag.c) */
