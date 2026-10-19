@@ -5,8 +5,8 @@
 (menus 60 fps, battles at the game's own 30 fps, smooth FMVs), but it has **not been played all the way
 through**, so expect the odd bug.
 
-**[Download the latest VPK (r09)](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/releases/latest)**
-([direct link](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/raw/main/downloads/VandalHearts-Vita-r09.vpk))
+**[Download the latest VPK (r09)](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/raw/main/downloads/VandalHearts-Vita-r09.vpk)**
+· [All releases](https://github.com/DarthSully/VandalHearts-Slopified-Vita-Port/releases)
 · [Changelog](platform/vita/CHANGELOG.md)
 
 r09 fixes a freeze that could hit during battles on r07 and earlier.
