@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "pc_watchdog.h"
 #include "PsyQ/libcd.h"
 #include "pc_lang.h"
 #include "pc_platform.h"
@@ -440,6 +441,7 @@ int CdSync(int mode, u_char *result) {
 }
 
 int CdRead(int sectors, unsigned int *buf, int mode) {
+    VH_WD_STAGE("cd: CdRead");
     /* Real CdRead compares its mode argument with the drive-mode shadow and issues CdlSetmode on
      * mismatch; the JP loader relies on it (per-read CdlModeSpeed, no separate Setmode). A zero mode
      * keeps the current mode (US passes 0 after Setmode(0x80)). See cd-xa.md, "The mode argument". */
@@ -628,6 +630,7 @@ static unsigned int s_fakeMovieSectorData[2];
 /* Decode the STR video for frame `frameNo` and hand it to the GPU as a fullscreen overlay: demux
  * the frame's video sectors from the disc image, assemble the BS bitstream, decode in pc_mdec.c. */
 static void MovieRenderFrame(int frameNo) {
+    VH_WD_STAGE("movie: decoding frame");
     if (!s_disc || !s_movieActive || frameNo < 1) return;
     PC_MovieSubsFrame(frameNo);   /* this frame is becoming current (native or HD) */
     if (s_movieHd) {                             /* HD FMV: present the HD frame, skip MDEC */

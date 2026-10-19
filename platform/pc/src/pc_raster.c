@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>     /* band-parallel hi-res rasterization (winpthreads on MinGW) */
+#include "pc_watchdog.h"
 
 #include "PsyQ/libgpu.h"
 #include "pc_platform.h"
@@ -809,14 +810,16 @@ static int PoolClaimChunk(void) {
     pthread_mutex_unlock(&s_hpool.mtx);
     return i;
 }
-static void PoolRunChunks(void) {
+static void PoolRunChunks(int wd) {
     int i;
     if (s_hpool.fn) {
-        while ((i = PoolClaimChunk()) >= 0) s_hpool.fn(i, s_hpool.fnCtx);
+        while ((i = PoolClaimChunk()) >= 0) { VH_WD_WORKER(wd, "parallel-for item", i); s_hpool.fn(i, s_hpool.fnCtx); }
         return;
     }
-    while ((i = PoolClaimChunk()) >= 0)
+    while ((i = PoolClaimChunk()) >= 0) {
+        VH_WD_WORKER(wd, "raster chunk", i);
         PrimListRasterizeBand(s_hpool.list, s_hpool.chunkY[i], s_hpool.chunkH[i]);
+    }
 }
 
 #ifdef __vita__
@@ -829,11 +832,13 @@ static void *HiresPoolWorker(void *arg) {
     PC_VitaRasterWorkerStart(id);
 #endif
     for (;;) {
+        VH_WD_WORKER(id + 1, "idle", -1);
         pthread_mutex_lock(&s_hpool.mtx);
         while (s_hpool.gen == seen) pthread_cond_wait(&s_hpool.start_cv, &s_hpool.mtx);
         seen = s_hpool.gen;
         pthread_mutex_unlock(&s_hpool.mtx);
-        PoolRunChunks();
+        PoolRunChunks(id + 1);
+        VH_WD_WORKER(id + 1, "reporting done", -1);
         pthread_mutex_lock(&s_hpool.mtx);
         if (++s_hpool.done == s_hpool.nworkers) {
             clock_gettime(CLOCK_MONOTONIC, &s_hpool.t1);
@@ -877,7 +882,7 @@ static void PrimListDispatch(const PrimList *l, int clipY, int clipH, int nth, i
     pthread_cond_broadcast(&s_hpool.start_cv);
     pthread_mutex_unlock(&s_hpool.mtx);
     if (async) return;
-    PoolRunChunks();                              /* this thread claims chunks alongside the workers */
+    PoolRunChunks(0);                             /* this thread claims chunks alongside the workers */
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
     s_hpool.busy = 0;
@@ -903,7 +908,9 @@ void PC_PoolParallelFor(int n, void (*fn)(int, void *), void *ctx) {
     s_hpool.busy = 1;
     pthread_cond_broadcast(&s_hpool.start_cv);
     pthread_mutex_unlock(&s_hpool.mtx);
-    PoolRunChunks();
+    VH_WD_STAGE("pool: parallel-for (movie decode)");
+    PoolRunChunks(0);
+    VH_WD_STAGE("pool: parallel-for, waiting for workers");
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
     s_hpool.busy = 0; s_hpool.fn = NULL;
@@ -923,7 +930,9 @@ int NativeRasterDone(void) {
 }
 long NativeRasterWait(void) {
     if (!s_hpool.busy) return 0;
-    if (!s_hpool.fn) PoolRunChunks();   /* draw the bands nobody has claimed yet instead of idling */
+    VH_WD_STAGE("raster: main thread drawing leftover chunks");
+    if (!s_hpool.fn) PoolRunChunks(0);   /* draw the bands nobody has claimed yet instead of idling */
+    VH_WD_STAGE("raster: waiting for workers");
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
     s_hpool.busy = 0;
@@ -984,6 +993,24 @@ static int NativeListHasFeedback(const PrimList *l, int cx, int cy, int cw, int 
     return 0;
 }
 
+/* VH_RASTER_FEEDBACK_THREADED=1 (the Vita no_serial switch) threads overlap frames too: a test
+ * switch, as those frames may then sample a half-drawn area. */
+static int FeedbackThreaded(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("VH_RASTER_FEEDBACK_THREADED");
+        on = (v && v[0] == '1') ? 1 : 0;
+    }
+    return on;
+}
+
+/* Pool state for the hang watchdog. Lock-free on purpose: a hung thread may hold the mutex. */
+int PC_RasterPoolDebug(char *out, int cap) {
+    return snprintf(out, (size_t)cap, "inited=%d workers=%d gen=%u done=%d next=%d/%d busy=%d job=%s",
+                    s_hpool.inited, s_hpool.nworkers, s_hpool.gen, s_hpool.done, s_hpool.next,
+                    s_hpool.nchunks, s_hpool.busy, s_hpool.fn ? "parallel-for" : "raster");
+}
+
 /* Async-capable flush: returns 1 when the pass was dispatched to the workers and is still running
  * (the list must not be touched until NativeRasterWait), 0 when it completed synchronously. */
 int NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH, int async) {
@@ -993,13 +1020,17 @@ int NativeRasterizeFlush(int clipX, int clipY, int clipW, int clipH, int async) 
     (void)AccurateEnabled();                          /* warm the lazy cache before the parallel section */
     if (nth <= 1 || clipH < nth * 2 || s_nlist.n < 16) {
         PrimListRasterizeBand(&s_nlist, clipY, clipH);
-    } else if (NativeListHasFeedback(&s_nlist, clipX, clipY, clipW, clipH)) {
+    } else if (!FeedbackThreaded() && NativeListHasFeedback(&s_nlist, clipX, clipY, clipW, clipH)) {
         if (!s_fbLogged) { s_fbLogged = 1; fprintf(stderr, "[raster] texture/draw-area overlap: frame drawn serially\n"); }
+        VH_WD_SERIAL_FRAME();
+        VH_WD_STAGE("raster: serial (overlap) frame");
         PrimListRasterizeBand(&s_nlist, clipY, clipH);
     } else if (async && nth > 1) {
+        VH_WD_STAGE("raster: dispatching async pass");
         PrimListDispatch(&s_nlist, clipY, clipH, nth, 1);
         return 1;                                 /* list stays live until NativeRasterWait */
     } else {
+        VH_WD_STAGE("raster: threaded pass (sync)");
         PrimListRasterizeThreaded(&s_nlist, clipY, clipH, nth);
     }
     s_nlist.n = 0;

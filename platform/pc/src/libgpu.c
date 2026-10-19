@@ -11,6 +11,7 @@
 #include "pc_lang.h"       /* PC_LangPatchFwdUpload: pack glyphs stamped into the F_WD sheet upload */
 #include "pc_platform.h"
 #include "pc_gpu_internal.h"   /* seams with the extracted subsystem TUs (pc_gpu_trace.c, ...) */
+#include "pc_watchdog.h"
 
 #define VRAM_W 1024
 #define VRAM_H 512
@@ -59,7 +60,9 @@ int DrawSync(int mode) {
     extern int NativeRasterDone(void);
     extern void PC_AudioPumpEarly(void);
     (void)mode;
+    VH_WD_STAGE("gpu: DrawSync");
     if (PC_GpuAsyncInFlight() && !NativeRasterDone()) PC_AudioPumpEarly();
+    VH_WD_STAGE("gpu: DrawSync, finishing frame");
     PC_GpuAsyncFinish();
     return 0;
 }
@@ -395,6 +398,7 @@ void PC_GpuAsyncFinish(void) {
     }
     if (s_presentPending) {
         s_presentPending = 0;
+        VH_WD_STAGE("gpu: present");
         PresentDispEnv(&s_presentDisp);
     }
 }
@@ -418,7 +422,9 @@ void DrawOTag(unsigned int *p) {
     if (s_tileLogReq) { s_tileLogFrame = s_drawFrame; s_tileLogReq = 0; }
     HiresEnsure();                           /* self-gated: allocates when scale > 1 OR a langpack
                                               * ships localized backgrounds (shadow pass at 1x) */
+    VH_WD_STAGE("gpu: DrawOTag, finishing previous frame");
     PC_GpuAsyncFinish();                     /* previous frame: finish drawing and present it */
+    VH_WD_STAGE("gpu: DrawOTag, walking ordering table");
     HiresFrameReset();                       /* reset the per-frame hi-res display list */
     const int nativeDefer = NativeDeferActive();   /* record the native pass, rasterize banded below */
     NativeFrameReset();

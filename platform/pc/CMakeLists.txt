@@ -263,7 +263,7 @@ endfunction()
 
 set(ALL_OBJ_SRCS ${GAME_SRCS})
 if(VH_VITA)
-    set(VITA_SRCS ${VITA_DIR}/src/vita_al.c ${VITA_DIR}/src/vita_platform.c)
+    set(VITA_SRCS ${VITA_DIR}/src/vita_al.c ${VITA_DIR}/src/vita_platform.c ${VITA_DIR}/src/vita_watchdog.c)
     list(APPEND ALL_OBJ_SRCS ${VITA_SRCS})
 endif()
 foreach(_b ${BACKEND_PLAIN} libetc pc_diag pc_battle_speed libsnd libgte pc_gpu_window pc_balance ${DATA_PERM} ${DATA_PLAIN})

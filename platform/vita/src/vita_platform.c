@@ -169,11 +169,21 @@ __attribute__((constructor(100))) static void VitaEarlyInit(void) {
                     "\n");
 
     /* Switch files in the data folder (empty files). */
+    if (VitaFileExists("no_serial")) {
+        setenv("VH_RASTER_FEEDBACK_THREADED", "1", 0);
+        fprintf(stderr, "[vita] no_serial: overlap frames drawn threaded (test switch)\n");
+    }
+
     if (VitaFileExists("profile")) {
         setenv("VH_PRESENT_TIME", "1", 0);
         setenv("VH_RASTER_TIME", "1", 0);
         setenv("VH_FRAME_TIME", "1", 0);
         setenv("VH_FPS_LOG", "1", 0);
         fprintf(stderr, "[vita] profile: present/raster timing on\n");
+    }
+
+    {
+        extern void PC_VitaWatchdogStart(void);
+        PC_VitaWatchdogStart();
     }
 }

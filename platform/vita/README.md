@@ -36,6 +36,13 @@ Empty files in `ux0:data/vandalhearts/`:
 |---|---|
 | `profile` | Timing lines in the log: FPS, work/idle split, raster, present, audio, MDEC |
 | `no_core3` | Keep the port off core 3 even when a core-unlock plugin makes it available |
+| `no_serial` | Test switch: draw texture/draw-area overlap frames threaded (may glitch those effects) |
+| `no_watchdog` | Turn off the hang watchdog |
+
+**Hang watchdog.** If no frame completes for 6 s (20 s at boot; `VH_WATCHDOG_SECONDS` in
+`vandalhearts.ini`), the port writes `hang_report.txt` (also appended to the log) with the main
+thread's last stage and the drawing threads' state, then faults on purpose so the Vita writes a
+`ux0:data/psp2core-*.psp2dmp`. Read the dump against that build's unstripped ELF.
 
 Performance-related `vandalhearts.ini` keys: `VH_RASTER_THREADS` (default 4 with core 3 unlocked,
 else 3), `VH_NATIVE_THREADS=0` (draw on one thread), `VH_RASTER_ASYNC=0` (no drawing/game overlap).

@@ -3,7 +3,7 @@
 Read this first when resuming work on the Vita port. Player-facing install/controls are in
 [README.md](README.md); this file is for whoever continues the work.
 
-## State (build r07)
+## State (build r08)
 
 - Base: HalmyLyseas/VandalHearts-PcPort `14552ff` (v2.1.0 + packaging fix). The port is the
   `vita` branch: one commit per build, `git log 14552ff..vita`.
@@ -49,7 +49,16 @@ platform/vita/build.sh "<disc>.bin" <KROMDAT.BIN | PS1 BIOS | charset2_us.bin> r
 | r04 | span fast path, async raster | battle 18-25 fps; main thread ~27 ms of non-raster work |
 | r05 | division-free reverb, inline lrintf | battle 25-30 fps; seq+spu 5-14 ms; MDEC 34 ms/frame |
 | r06 | VSync never blocks on drawing; MDEC across the pool | battle ~27-30 fps (main: ~14 ms raster wait + ~12 ms SPU, serial); FMV 35 ticks/s, MDEC 14.5 ms |
-| r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | (pending) |
+| r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | battle 30 fps, FMV ~55-60; intermittent hard hang (silent) ~2 s after the first texture/draw-area overlap frame in a battle; intermittent black screen at boot |
+| r08 | hang watchdog (breadcrumbs + deliberate fault for a core dump), `no_serial` test switch | (pending) |
+
+## Hang watchdog (r08)
+
+`platform/vita/src/vita_watchdog.c` runs a thread on core 2 that polls `g_vhWdFrames` (bumped at the
+end of VSync) every 250 ms. Counting polls instead of reading the clock keeps a suspended Vita from
+tripping it. On a stall it writes `hang_report.txt` with sceIo only (the hung thread may hold
+stderr's lock), then writes to address 8 so the kernel produces a core dump with every thread's
+registers. Breadcrumb macros live in `platform/pc/src/pc_watchdog.h` and compile to nothing off-Vita.
 
 ## Where the time still goes / next ideas
 

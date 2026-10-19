@@ -9,6 +9,7 @@
 #include "pc_lang.h"
 #include "pc_platform.h"
 #include "pc_etc_internal.h"
+#include "pc_watchdog.h"
 #include "pc_balance.h"
 #include "pc_overlay.h"
 
@@ -262,8 +263,10 @@ static void PC_AudioPump(void) {
     extern void PC_SeqTick(void);
     if (on < 0) on = getenv("VH_FRAME_TIME") ? 1 : 0;   /* VH_FRAME_TIME=1: the pumps' share */
     if (on) t0 = SDL_GetPerformanceCounter();
+    VH_WD_STAGE("audio: XA streaming");
     PC_CdXaUpdate();   /* XA music streaming pump */
     if (on) t1 = SDL_GetPerformanceCounter();
+    VH_WD_STAGE("audio: sequencer + SPU render");
     PC_SeqTick();      /* SEQ (sequenced music) sequencer + software SPU render */
     if (on) {
         double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
@@ -296,6 +299,7 @@ int VSync(int mode) {
         return (int)s_vblankCount;
     }
 
+    VH_WD_STAGE("vsync: enter");
     PC_DiagFrameEntry(mode);   /* VH_FRAME_TIME work/idle split (pc_diag.c) */
 
     /* Answer the compositor's responsiveness ping (and keep close/Ctrl+C live) even inside the
@@ -322,6 +326,7 @@ int VSync(int mode) {
             extern void PC_GpuAsyncService(void);
             PC_GpuAsyncService();
             now = SDL_GetTicks();
+            VH_WD_STAGE("vsync: pacing sleep");
             if ((double)now < s_nextVBlankMs)
                 PC_DiagIdleDelay((unsigned)(s_nextVBlankMs - now));   /* SDL_Delay, timed under VH_FRAME_TIME */
             PC_GpuAsyncService();
@@ -343,6 +348,8 @@ int VSync(int mode) {
     PC_SmokeFrame();   /* VH_SMOKE boot harness: exit at the title screen (pc_diag.c) */
 
     PC_DiagFps(mode);   /* opt-in per-second FPS meter, VH_FPS_LOG=1 (pc_diag.c) */
+    VH_WD_FRAME_DONE();
+    VH_WD_STAGE("game code (between VSyncs)");
 
     return (int)s_vblankCount;
 }
