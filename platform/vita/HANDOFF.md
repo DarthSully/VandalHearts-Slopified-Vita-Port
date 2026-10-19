@@ -49,9 +49,9 @@ platform/vita/build.sh "<disc>.bin" <KROMDAT.BIN | PS1 BIOS | charset2_us.bin> r
 | r04 | span fast path, async raster | battle 18-25 fps; main thread ~27 ms of non-raster work |
 | r05 | division-free reverb, inline lrintf | battle 25-30 fps; seq+spu 5-14 ms; MDEC 34 ms/frame |
 | r06 | VSync never blocks on drawing; MDEC across the pool | battle ~27-30 fps (main: ~14 ms raster wait + ~12 ms SPU, serial); FMV 35 ticks/s, MDEC 14.5 ms |
-| r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | battle 30 fps, FMV ~55-60; intermittent hard hang (silent) ~2 s after the first texture/draw-area overlap frame in a battle; intermittent black screen at boot |
+| r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | battle 30 fps, FMV ~55-60; intermittent silent hard hang in battles (the timing near overlap frames was coincidental, see r08); intermittent black screen at boot |
 | r08 | hang watchdog (breadcrumbs + deliberate fault for a core dump), `no_serial` test switch | hang caught: main thread waiting on the pool with done=2/3 while all 3 workers were idle (a lost done signal) |
-| r09 | pool handshake on kernel semaphores + atomics; "workers late" log line; watchdog appends to the log | (pending) |
+| r09 | pool handshake on kernel semaphores + atomics; "workers late" log line; watchdog appends to the log | chapter 1 played through with no hangs or hiccups (released) |
 
 ## Hang watchdog (r08)
 
