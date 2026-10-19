@@ -44,8 +44,9 @@ static void WdReport(unsigned frames, int polls) {
                  PC_GpuAsyncInFlight(), g_vhWdSerialFrames, g_vhWdLastSerialFrame, pool);
     for (i = 0; i < 8 && n > 0 && n < (int)sizeof(buf); i++) {
         if (!g_vhWdWorker[i]) continue;
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "[watchdog] worker %d: %s (chunk %d)\n", i,
-                      g_vhWdWorker[i], g_vhWdWorkerChunk[i]);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, i ? "[watchdog] worker %d: %s (chunk %d)\n"
+                        : "[watchdog] main thread's own drawing (%d): last %s (chunk %d)\n",
+                      i, g_vhWdWorker[i], g_vhWdWorkerChunk[i]);
     }
     if (n > 0 && n < (int)sizeof(buf))
         snprintf(buf + n, sizeof(buf) - (size_t)n,
@@ -55,7 +56,8 @@ static void WdReport(unsigned frames, int polls) {
                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
         WdWrite(fd, buf);
         if (fd >= 0) sceIoClose(fd);
-        fd = sceIoOpen("ux0:data/vandalhearts/vandalhearts.log", SCE_O_WRONLY | SCE_O_APPEND, 0777);
+        fd = sceIoOpen("ux0:data/vandalhearts/vandalhearts.log", SCE_O_WRONLY, 0777);
+        if (fd >= 0) sceIoLseek(fd, 0, SCE_SEEK_END);   /* add to the end; never overwrite the log */
         WdWrite(fd, buf);
         if (fd >= 0) sceIoClose(fd);
     }

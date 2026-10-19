@@ -9,6 +9,10 @@
 #include <time.h>
 #include <pthread.h>     /* band-parallel hi-res rasterization (winpthreads on MinGW) */
 #include "pc_watchdog.h"
+#ifdef __vita__
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/error.h>
+#endif
 
 #include "PsyQ/libgpu.h"
 #include "pc_platform.h"
@@ -801,8 +805,47 @@ static struct {
     pthread_cond_t start_cv, done_cv;
     unsigned gen;   /* bumped per dispatch */
     int done;       /* workers finished this gen */
+#ifdef __vita__
+    SceUID startSem, doneSem;   /* one start token per worker per dispatch; one done signal per token */
+#endif
 } s_hpool;
 
+#ifdef __vita__
+/* On the Vita the pool's handshake uses kernel semaphores and atomics instead of pthread-embedded's
+ * mutex/condvar, which lost a done signal under load (watchdog report + core dump). A counting
+ * semaphore cannot drop a wake-up or a count. See platform/vita/HANDOFF.md, "Pool handshake". */
+static int PoolClaimChunk(void) {
+    int i = __atomic_fetch_add(&s_hpool.next, 1, __ATOMIC_ACQ_REL);
+    return (i < s_hpool.nchunks) ? i : -1;
+}
+static void PoolRelease(void) {   /* job fields are set; hand out one start token per worker */
+    __atomic_store_n(&s_hpool.done, 0, __ATOMIC_SEQ_CST);
+    s_hpool.gen++;
+    s_hpool.busy = 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (s_hpool.nworkers > 0) sceKernelSignalSema(s_hpool.startSem, s_hpool.nworkers);
+}
+static void PoolWaitDone(void) {
+    int warned = 0;
+    if (s_hpool.nworkers <= 0) return;
+    for (;;) {
+        SceUInt timeout = 250000;
+        int r = sceKernelWaitSema(s_hpool.doneSem, s_hpool.nworkers, &timeout);
+        if (r >= 0) break;
+        if (r != (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) {   /* should not happen: fall back to polling */
+            while (__atomic_load_n(&s_hpool.done, __ATOMIC_ACQUIRE) < s_hpool.nworkers) sceKernelDelayThread(100);
+            fprintf(stderr, "[raster] pool: done-semaphore wait failed (0x%08x), polled instead\n", (unsigned)r);
+            break;
+        }
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[raster] pool: workers late (done=%d/%d after 250 ms, gen=%u)\n",
+                    __atomic_load_n(&s_hpool.done, __ATOMIC_ACQUIRE), s_hpool.nworkers, s_hpool.gen);
+        }
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+#else
 static int PoolClaimChunk(void) {
     int i;
     pthread_mutex_lock(&s_hpool.mtx);
@@ -810,6 +853,7 @@ static int PoolClaimChunk(void) {
     pthread_mutex_unlock(&s_hpool.mtx);
     return i;
 }
+#endif
 static void PoolRunChunks(int wd) {
     int i;
     if (s_hpool.fn) {
@@ -830,6 +874,16 @@ static void *HiresPoolWorker(void *arg) {
     int id = (int)(uintptr_t)arg; unsigned seen = 0;   /* LLP64-safe: Win64 long is 32-bit */
 #ifdef __vita__
     PC_VitaRasterWorkerStart(id);
+    (void)seen;
+    for (;;) {
+        VH_WD_WORKER(id + 1, "idle", -1);
+        sceKernelWaitSema(s_hpool.startSem, 1, NULL);
+        PoolRunChunks(id + 1);
+        VH_WD_WORKER(id + 1, "reporting done", -1);
+        if (__atomic_add_fetch(&s_hpool.done, 1, __ATOMIC_ACQ_REL) == s_hpool.nworkers)
+            clock_gettime(CLOCK_MONOTONIC, &s_hpool.t1);
+        sceKernelSignalSema(s_hpool.doneSem, 1);
+    }
 #endif
     for (;;) {
         VH_WD_WORKER(id + 1, "idle", -1);
@@ -852,6 +906,10 @@ static void *HiresPoolWorker(void *arg) {
 
 static void HiresPoolInit(int nworkers) {
     int i;
+#ifdef __vita__
+    s_hpool.startSem = sceKernelCreateSema("vh_pool_start", 0, 0, 64, NULL);
+    s_hpool.doneSem = sceKernelCreateSema("vh_pool_done", 0, 0, 64, NULL);
+#endif
     pthread_mutex_init(&s_hpool.mtx, NULL);
     pthread_cond_init(&s_hpool.start_cv, NULL);
     pthread_cond_init(&s_hpool.done_cv, NULL);
@@ -869,6 +927,22 @@ static void PrimListDispatch(const PrimList *l, int clipY, int clipH, int nth, i
     n = (nth * 6 < RASTER_MAX_CHUNKS) ? nth * 6 : RASTER_MAX_CHUNKS;   /* small chunks: even tails */
     if (n > clipH) n = clipH;
     per = clipH / n; rem = clipH % n; y = clipY;
+#ifdef __vita__
+    s_hpool.list = l;
+    for (i = 0; i < n; i++) {
+        int h = per + (i < rem ? 1 : 0);
+        s_hpool.chunkY[i] = y; s_hpool.chunkH[i] = h; y += h;
+    }
+    s_hpool.nchunks = n;
+    __atomic_store_n(&s_hpool.next, 0, __ATOMIC_SEQ_CST);
+    clock_gettime(CLOCK_MONOTONIC, &s_hpool.t0);
+    PoolRelease();
+    if (async) return;
+    PoolRunChunks(0);
+    PoolWaitDone();
+    s_hpool.busy = 0;
+    return;
+#endif
     pthread_mutex_lock(&s_hpool.mtx);
     s_hpool.list = l;
     for (i = 0; i < n; i++) {
@@ -901,6 +975,18 @@ void PC_PoolParallelFor(int n, void (*fn)(int, void *), void *ctx) {
     if (nth <= 1 || n < 2) { for (i = 0; i < n; i++) fn(i, ctx); return; }
     PC_GpuAsyncFinish();
     if (!s_hpool.inited) HiresPoolInit(nth - 1);
+#ifdef __vita__
+    s_hpool.fn = fn; s_hpool.fnCtx = ctx;
+    s_hpool.nchunks = n;
+    __atomic_store_n(&s_hpool.next, 0, __ATOMIC_SEQ_CST);
+    PoolRelease();
+    VH_WD_STAGE("pool: parallel-for (movie decode)");
+    PoolRunChunks(0);
+    VH_WD_STAGE("pool: parallel-for, waiting for workers");
+    PoolWaitDone();
+    s_hpool.busy = 0; s_hpool.fn = NULL;
+    return;
+#endif
     pthread_mutex_lock(&s_hpool.mtx);
     s_hpool.fn = fn; s_hpool.fnCtx = ctx;
     s_hpool.nchunks = n; s_hpool.next = 0;
@@ -923,6 +1009,9 @@ int NativeRasterBusy(void) { return s_hpool.busy; }
 int NativeRasterDone(void) {
     int d;
     if (!s_hpool.busy) return 1;
+#ifdef __vita__
+    return __atomic_load_n(&s_hpool.done, __ATOMIC_ACQUIRE) >= s_hpool.nworkers;
+#endif
     pthread_mutex_lock(&s_hpool.mtx);
     d = (s_hpool.done == s_hpool.nworkers);
     pthread_mutex_unlock(&s_hpool.mtx);
@@ -933,10 +1022,15 @@ long NativeRasterWait(void) {
     VH_WD_STAGE("raster: main thread drawing leftover chunks");
     if (!s_hpool.fn) PoolRunChunks(0);   /* draw the bands nobody has claimed yet instead of idling */
     VH_WD_STAGE("raster: waiting for workers");
+#ifdef __vita__
+    PoolWaitDone();
+    s_hpool.busy = 0;
+#else
     pthread_mutex_lock(&s_hpool.mtx);
     while (s_hpool.done != s_hpool.nworkers) pthread_cond_wait(&s_hpool.done_cv, &s_hpool.mtx);
     s_hpool.busy = 0;
     pthread_mutex_unlock(&s_hpool.mtx);
+#endif
     return (long)((s_hpool.t1.tv_sec - s_hpool.t0.tv_sec) * 1000000L + (s_hpool.t1.tv_nsec - s_hpool.t0.tv_nsec) / 1000);
 }
 

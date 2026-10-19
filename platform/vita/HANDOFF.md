@@ -3,7 +3,7 @@
 Read this first when resuming work on the Vita port. Player-facing install/controls are in
 [README.md](README.md); this file is for whoever continues the work.
 
-## State (build r08)
+## State (build r09)
 
 - Base: HalmyLyseas/VandalHearts-PcPort `14552ff` (v2.1.0 + packaging fix). The port is the
   `vita` branch: one commit per build, `git log 14552ff..vita`.
@@ -50,7 +50,8 @@ platform/vita/build.sh "<disc>.bin" <KROMDAT.BIN | PS1 BIOS | charset2_us.bin> r
 | r05 | division-free reverb, inline lrintf | battle 25-30 fps; seq+spu 5-14 ms; MDEC 34 ms/frame |
 | r06 | VSync never blocks on drawing; MDEC across the pool | battle ~27-30 fps (main: ~14 ms raster wait + ~12 ms SPU, serial); FMV 35 ticks/s, MDEC 14.5 ms |
 | r07 | no movie spin-wait; table MDEC parse; audio pumped during drawing; main thread helps draw | battle 30 fps, FMV ~55-60; intermittent hard hang (silent) ~2 s after the first texture/draw-area overlap frame in a battle; intermittent black screen at boot |
-| r08 | hang watchdog (breadcrumbs + deliberate fault for a core dump), `no_serial` test switch | (pending) |
+| r08 | hang watchdog (breadcrumbs + deliberate fault for a core dump), `no_serial` test switch | hang caught: main thread waiting on the pool with done=2/3 while all 3 workers were idle (a lost done signal) |
+| r09 | pool handshake on kernel semaphores + atomics; "workers late" log line; watchdog appends to the log | (pending) |
 
 ## Hang watchdog (r08)
 
@@ -59,6 +60,26 @@ end of VSync) every 250 ms. Counting polls instead of reading the clock keeps a 
 tripping it. On a stall it writes `hang_report.txt` with sceIo only (the hung thread may hold
 stderr's lock), then writes to address 8 so the kernel produces a core dump with every thread's
 registers. Breadcrumb macros live in `platform/pc/src/pc_watchdog.h` and compile to nothing off-Vita.
+
+## Pool handshake (r09)
+
+The r08 watchdog caught the hang: all chunks drawn, all workers idle, `done` stuck at 2 of 3. The
+pool's mutex/condvar come from pthread-embedded, written for the single-core PSP; on the Vita one
+done signal went missing. On `__vita__` the pool now uses one kernel counting semaphore for start
+tokens (one per worker per dispatch) and one for done signals (the dispatcher waits for N), with
+chunk claiming and the done count as atomics. Desktop builds keep the pthread code.
+
+A fast worker may take a second start token of the same dispatch; it finds no chunks, signals done,
+and the slow worker simply picks up the next dispatch's token. N tokens always yield N done signals,
+and a token holder signals done only after its own chunks, so the wait still means "all drawn".
+
+Verification (host, `__vita__` path compiled against a POSIX stand-in for the kernel semaphores,
+random sleeps/yields at every semaphore operation): `raster_selftest.c` threaded vs inline identical;
+a stress harness of parallel-for jobs (each item exactly once) and async raster passes polled with
+NativeRasterDone (identical to a sync pass of the same list) at 2, 3 and 4 threads.
+
+Side finding, not changed: a 15-bit texture whose page starts within 256 halfwords of VRAM's right
+edge reads `s_vram[y][x >= 1024]`, i.e. the next row, where hardware wraps x. Not seen in game data.
 
 ## Where the time still goes / next ideas
 
